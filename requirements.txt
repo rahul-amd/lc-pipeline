@@ -1,0 +1,35 @@
+# lc-pipeline dependencies.
+#
+# Install the core set with:  pip install -r requirements.txt
+# The pipeline degrades gracefully: Phase-1 generation + the whitespace tokenizer
+# need only the "core" group; the heavier groups are pulled in per stage.
+
+# --- core: Phase-1 synthetic tasks + Phase-2 corpus I/O ---------------------- #
+numpy
+scipy                 # ruler_pp/tasks/freq_words.py -> scipy.special.zeta
+pyarrow               # FinePDFs parquet streaming (corpus.loader, untie, benches)
+
+# --- Phase 2a: embedding-similarity clustering (corpus.cluster) -------------- #
+# torch is a SPECIAL build on this box: install the CUDA-12.8 ("cu128") wheel in
+# WSL separately (the cu130 build deadlocks on the RTX 5060 Ti / sm_120). See the
+# README hardware note; do NOT `pip install torch` from PyPI into that venv.
+torch                 # install via the cu128 index-url, not plain PyPI
+sentence-transformers # Qwen3-Embedding-0.6B encoder
+tqdm                  # progress bars (optional; code falls back to a no-op)
+
+# --- visualization (ruler_pp/viz.py, untie/viz.py) --------------------------- #
+gradio
+networkx              # optional: draws graph_* task samples in ruler_pp.viz
+matplotlib            # optional: backend for the graph drawing (falls back to text)
+
+# --- optional: exact-budget tokenizers (only with --tokenizer hf:/tiktoken) -- #
+# The default --tokenizer whitespace is dependency-free; install these only if
+# you need real token counts.
+transformers          # --tokenizer hf:<name>
+tiktoken              # --tokenizer tiktoken[:enc]
+
+# --- corpus download (scripts/download_finepdfs.py) -------------------------- #
+huggingface_hub
+
+# --- not required ------------------------------------------------------------ #
+# vllm  -> scripts/vllm_bench.py only; ruled out on this GPU, kept for the record.
