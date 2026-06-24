@@ -30,6 +30,7 @@ tiktoken              # --tokenizer tiktoken[:enc]
 
 # --- corpus download (scripts/download_finepdfs.py) -------------------------- #
 huggingface_hub
+hf_transfer           # optional: Rust multi-connection downloader; auto-enabled if installed
 
 # --- not required ------------------------------------------------------------ #
 # vllm  -> scripts/vllm_bench.py only; ruled out on this GPU, kept for the record.

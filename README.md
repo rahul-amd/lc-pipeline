@@ -118,6 +118,15 @@ python -m untie --output_dir untie_out_full \
 regime), `--max_clusters` / `--max_single_docs` / `--samples_per_doc`,
 quality filters `--min_doc_tokens` / `--min_tokens` / `--min_edu` / `--keep_dups`.
 
+`--num_samples` sets an optional **per-flow** target (each `<flow>.jsonl` aims for
+this many rows). The sources are streamed once; if the pool is exhausted before
+the target, it is reused — each reuse re-chunks/re-spans/re-shuffles under a fresh
+seed, so reused docs yield distinct samples (variety is greatest for docs larger
+than the window; docs that fit only vary by shuffle). `--max_reuse` (default 5)
+caps the extra passes and stops early if a full pass adds nothing. The reuse pool
+is bounded by `--max_clusters` + `--max_single_docs`, so raise those for a larger,
+more varied pool. Unset `--num_samples` = the original single pass.
+
 > Hardware note: embedding in Phase 2a runs on an RTX 5060 Ti (Blackwell, sm_120,
 > 16 GB) via a CUDA-12.8 ("cu128") PyTorch toolchain in WSL — the newer cu130
 > build deadlocks on this card. Run the embedding/generation steps with that

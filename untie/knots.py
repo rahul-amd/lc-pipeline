@@ -26,6 +26,7 @@ dependency-free; pass --tokenizer hf:<name> for exact budgets).
   python -m untie --output_dir untie_out
   python -m untie --sources single --max_single_docs 2000 --format pt
   python -m untie --target_para_tokens 2000   # smaller chunks, harder reorder
+  python -m untie --num_samples 5000          # per-flow target; reuse sources to hit it
 """
 
 from __future__ import annotations
@@ -259,7 +260,16 @@ def main(argv=None):
     p.add_argument("--max_para_tokens", type=int, default=None,
                    help="paragraphs above this are hard-split into word windows (default: target)")
     p.add_argument("--min_units", type=int, default=2, help="skip samples with fewer chunks")
-    p.add_argument("--samples_per_doc", type=int, default=1, help="random spans drawn per source doc")
+    p.add_argument("--samples_per_doc", type=int, default=1, help="random spans drawn per source doc per pass")
+    p.add_argument("--num_samples", type=int, default=None,
+                   help="optional target number of samples PER FLOW. Once the source "
+                        "pool is exhausted, reuse it with fresh spans/shuffles until "
+                        "the target is hit. Unset = a single pass over the sources.")
+    p.add_argument("--max_reuse", type=int, default=5,
+                   help="with --num_samples: cap on extra passes over the source pool "
+                        "when it is exhausted before the target (stops early if a full "
+                        "pass adds nothing). The reuse pool is bounded by --max_clusters "
+                        "+ --max_single_docs.")
     p.add_argument("--max_clusters", type=int, default=1000)
     p.add_argument("--max_single_docs", type=int, default=1000)
     p.add_argument("--min_doc_tokens", type=int, default=8000, help="single-doc source: min token_count")
@@ -282,13 +292,19 @@ def main(argv=None):
     counts = {f: 0 for f in flows}
     counts["skipped"] = 0
     n_src = 0
+    target = args.num_samples
+
+    def all_done():
+        return target is not None and all(counts[f] >= target for f in flows)
 
     def emit(src_id, text):
         nonlocal n_src
         sidx = n_src
         n_src += 1
-        # one deterministic rng per source doc so chunking (incl. jitter) is the
-        # same across both flows and stable across runs.
+        # one deterministic rng per emit call so chunking (incl. jitter) is the
+        # same across both flows and stable across runs. sidx increments on every
+        # call (including reuse passes), so a reused source re-chunks and re-spans
+        # under a fresh seed -> a distinct sample rather than a byte-for-byte copy.
         unit_rng = random.Random((args.seed * 2_000_003 + sidx) & 0x7FFFFFFF)
         units = make_units(text, tokenizer.count, args.target_para_tokens,
                            max_para_tokens, unit_rng, args.target_jitter)
@@ -297,6 +313,8 @@ def main(argv=None):
             return
         for j in range(args.samples_per_doc):
             for fi, flow in enumerate(flows):
+                if target is not None and counts[flow] >= target:
+                    continue  # this flow has hit its per-flow target
                 # deterministic per (seed, source index, span, flow); int-only so
                 # it is stable across runs (unlike salted string hashing).
                 seed_i = (((args.seed * 1_000_003 + sidx) * 131 + j) * 7 + fi) & 0x7FFFFFFF
@@ -329,15 +347,44 @@ def main(argv=None):
                 writers[flow].write(json.dumps(row, ensure_ascii=False) + "\n")
                 counts[flow] += 1
 
-    try:
+    def source_stream():
         if "cluster" in sources:
-            for src_id, text in iter_cluster_docs(args.input_dir, args.clusters, args.max_clusters, rng):
-                emit(src_id, text)
+            yield from iter_cluster_docs(args.input_dir, args.clusters, args.max_clusters, rng)
         if "single" in sources:
-            for src_id, text in iter_single_docs(
-                    args.input_dir, args.min_doc_tokens, args.min_tokens,
-                    args.min_edu, not args.keep_dups, args.max_single_docs):
-                emit(src_id, text)
+            yield from iter_single_docs(
+                args.input_dir, args.min_doc_tokens, args.min_tokens,
+                args.min_edu, not args.keep_dups, args.max_single_docs)
+
+    reuse_passes = 0
+    distinct_sources = 0
+    try:
+        # Pass 1: stream every source once. When a per-flow target is set, also
+        # buffer the sources (pool bounded by the --max_* caps) so we can reuse
+        # them, and stop as soon as every flow has hit the target.
+        buffer = []
+        for src_id, text in source_stream():
+            emit(src_id, text)
+            if target is not None:
+                buffer.append((src_id, text))
+                if all_done():
+                    break
+        distinct_sources = n_src  # emit calls so far == distinct sources streamed
+
+        # Reuse: cycle the buffered pool with fresh spans/shuffles until the
+        # target is hit, capped at --max_reuse passes; bail if a full pass adds
+        # nothing (e.g. every source is too short to ever reach min_units).
+        if target is not None and buffer and args.max_reuse > 0:
+            for _r in range(args.max_reuse):
+                if all_done():
+                    break
+                before = sum(counts[f] for f in flows)
+                for src_id, text in buffer:
+                    emit(src_id, text)
+                    if all_done():
+                        break
+                reuse_passes += 1
+                if sum(counts[f] for f in flows) == before:
+                    break  # a whole pass produced no new samples -> give up
     finally:
         for w in writers.values():
             w.close()
@@ -345,10 +392,14 @@ def main(argv=None):
     total = sum(counts[f] for f in flows)
     summary = {
         "output_dir": args.output_dir,
-        "source_documents": n_src,
+        "source_documents": distinct_sources,
+        "source_instances": n_src,  # includes reuse passes
         "samples": total,
         "by_flow": {f: counts[f] for f in flows},
         "skipped": counts["skipped"],
+        "num_samples_per_flow": target,
+        "target_met": all_done() if target is not None else None,
+        "reuse_passes": reuse_passes,
         "context_len": args.context_len,
         "target_para_tokens": args.target_para_tokens,
         "tokenizer": args.tokenizer,
