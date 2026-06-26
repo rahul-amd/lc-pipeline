@@ -76,6 +76,28 @@ Codes are random so gold is deterministic; metric = accuracy on the chosen lette
 knobs (flags): `--unanswerable_frac` (0.7), `--subtle_frac` (0.15),
 `--binding_frac`, `--n_choices`.
 
+**`multihop/` — multi-hop QA (LLM-in-the-loop).** The only generator that needs an
+LLM to *write* the data, so it runs in **two offline phases** with your inference
+engine in between — this repo never calls the model itself. `prepare` chunks each
+FinePDFs doc into ~512-token chunks, then for each doc emits several requests
+(`--requests_per_doc`, default 13), each sampling 3–4 random chunks. Every request
+is a **system + user** `messages` array: the system turn asks for **one** QA pair
+whose answer needs a fact from *every* chunk shown (true multi-hop, not answerable
+from any single chunk), and to reply with the exact phrase `cannot generate` when
+the chunks share no usable common ground; the user turn carries the numbered
+chunks. Output: `requests.jsonl` (feed this to any engine) + `docs.jsonl` (doc→full
+text, for stitching). Requests are **over-generated** so that after the inevitable
+`cannot generate` misses each doc still lands near the 8–10 pair target. `assemble`
+takes the engine's responses, parses `Question:/Answer:` (dropping `cannot
+generate`), regroups per doc (order preserved, capped at `--max_pairs`), and writes
+the final `multihop.jsonl`:
+- **pt**: `text = "{doc}\n\nQuestion: …\nAnswer: …\nQuestion: …\nAnswer: …"`;
+- **sft**: `messages = [{user: "{doc}\n\n1. q1\n2. q2…"}, {assistant: "1. a1\n2. a2…"}]`.
+
+Response parsing auto-detects common engine schemas (our simple `{id, response}`,
+OpenAI chat/batch `choices[].message.content`, vLLM, raw text fields), overridable
+via `--id_field` / `--text_field`.
+
 ## Shared framework
 
 `ruler_pp/base.py` defines `Sample` plus two task bases: `Task` (synthetic) and
@@ -103,6 +125,8 @@ lc-pipeline/
   idk/                 abstention MCQ ("I don't know")
     idk.py               IDKTask + generator (python -m idk)
     viz.py               Gradio viewer for the generated samples (python -m idk.viz)
+  multihop/            multi-hop QA (LLM-in-the-loop, two phases)
+    multihop.py          prepare (emit LLM requests) + assemble (stitch responses)
   scripts/             utilities, checkers & one-off benchmarks
     download_finepdfs.py   pull the FinePDFs sample into finpdf_sample/
     verify_golds.py        independent re-checker for ruler++ golds
@@ -117,6 +141,7 @@ lc-pipeline/
   cluster_out/         clustering output (cluster labels, cached embeddings, summary)
   mrcr_out/            mrcr sample output (mrcr.jsonl)
   idk_out/             idk sample output (idk.jsonl)
+  multihop_out/        multihop requests.jsonl + docs.jsonl, then multihop.jsonl
 ```
 
 ## Usage
@@ -151,6 +176,14 @@ python -m idk --input_dir finpdf_sample --output_dir idk_out \
     --max_seq_length 8192 --num_samples 200 --format sft
 python scripts/verify_idk.py idk_out              # -> TOTAL: N/N samples verified
 python -m idk.viz --data_dir idk_out              # eyeball bindings, the question, gold option
+
+# multihop: multi-hop QA, LLM-in-the-loop (two phases around your inference run)
+# 1) emit requests for an inference engine (+ docs.jsonl for later stitching)
+python -m multihop prepare --input_dir finpdf_sample --output_dir multihop_out \
+    --num_docs 500 --requests_per_doc 13
+# 2) run multihop_out/requests.jsonl through your engine -> responses.jsonl, then:
+python -m multihop assemble --requests_dir multihop_out \
+    --responses responses.jsonl --format sft --max_pairs 10
 ```
 
 > Memory: the cluster source loads the text of every selected cluster's member

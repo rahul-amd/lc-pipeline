@@ -1,6 +1,6 @@
-"""Shared FinePDFs parquet loading + quality filtering (Phase 2).
+"""Shared FinePDFs parquet loading + quality filtering.
 
-Both Phase-2 stages read the same corpus the same way — detect the text/id
+Both corpus generators read the same corpus the same way — detect the text/id
 columns, stream row-group batches (a single FinePDFs file's text column is
 multi-GB, so we never materialise a whole file), and drop low-value rows using
 the metadata FinePDFs already ships:
