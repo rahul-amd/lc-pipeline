@@ -57,6 +57,25 @@ binary-searched by the shared fitter to fill the budget, so the same task scales
 across 32k/128k/1M. Difficulty knobs (in `meta`): `--k` (query arity),
 `--confounder_frac`, `--neg_frac` — all decoupled from length.
 
+**`idk/` — abstention MCQ ("I don't know").** Michelangelo's IDK
+(arXiv:2409.12640) adapted to deterministic, leakage-proof, no-LLM data. The
+context is a long numbered list of real FinePDFs passages; a subset get a
+**binding sentence** appended stating a random code for a named item
+(`"The access code for the lemon is 7F3A-21."` — markers from `res/markers.txt`,
+codes random). The question is a 4-way MCQ — *"What is the {attribute} code for
+the {marker}?"* — with one option always **"I don't know"** (shuffled, so it can
+be any letter):
+- **answerable (~30%)**: the (attribute, marker) pair is bound → gold = its code;
+- **unanswerable / absent**: the marker appears in no binding → gold = "I don't know";
+- **unanswerable / subtle (~15%)**: the marker *is* bound, but under a different
+  attribute than asked → gold = "I don't know", and its real code is planted among
+  the distractors as bait, so ignoring the attribute is punished.
+
+Codes are random so gold is deterministic; metric = accuracy on the chosen letter.
+`size` = number of paragraphs (binary-searched to fill the budget). Difficulty
+knobs (flags): `--unanswerable_frac` (0.7), `--subtle_frac` (0.15),
+`--binding_frac`, `--n_choices`.
+
 ## Shared framework
 
 `ruler_pp/base.py` defines `Sample` plus two task bases: `Task` (synthetic) and
@@ -81,10 +100,14 @@ lc-pipeline/
   mrcr/                MRCR-style marker retrieval
     mrcr.py              MRCRTask + passage-pool loader + generator (python -m mrcr)
     viz.py               Gradio viewer for the generated samples (python -m mrcr.viz)
+  idk/                 abstention MCQ ("I don't know")
+    idk.py               IDKTask + generator (python -m idk)
+    viz.py               Gradio viewer for the generated samples (python -m idk.viz)
   scripts/             utilities, checkers & one-off benchmarks
     download_finepdfs.py   pull the FinePDFs sample into finpdf_sample/
     verify_golds.py        independent re-checker for ruler++ golds
     verify_mrcr.py         independent re-checker for mrcr golds
+    verify_idk.py          independent re-checker for idk golds
     st_bench.py            SentenceTransformers throughput bench (cu128 toolchain)
     vllm_bench.py          vLLM embedding bench (ruled out on this GPU; kept for the record)
   requirements.txt     dependencies, grouped by stage (see comments inside)
@@ -93,6 +116,7 @@ lc-pipeline/
   finpdf_sample/       FinePDFs parquet shards (input corpus)
   cluster_out/         clustering output (cluster labels, cached embeddings, summary)
   mrcr_out/            mrcr sample output (mrcr.jsonl)
+  idk_out/             idk sample output (idk.jsonl)
 ```
 
 ## Usage
@@ -121,6 +145,12 @@ python -m mrcr --input_dir finpdf_sample --output_dir mrcr_out \
     --max_seq_length 8192 --num_samples 200 --format sft
 python scripts/verify_mrcr.py mrcr_out            # -> TOTAL: N/N samples verified
 python -m mrcr.viz --data_dir mrcr_out            # eyeball markers, the TARGET, answer
+
+# idk: abstention MCQ ("I don't know"), single-turn, deterministic gold
+python -m idk --input_dir finpdf_sample --output_dir idk_out \
+    --max_seq_length 8192 --num_samples 200 --format sft
+python scripts/verify_idk.py idk_out              # -> TOTAL: N/N samples verified
+python -m idk.viz --data_dir idk_out              # eyeball bindings, the question, gold option
 ```
 
 > Memory: the cluster source loads the text of every selected cluster's member
