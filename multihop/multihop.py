@@ -116,8 +116,18 @@ def prepare(args):
     req_path = os.path.join(args.output_dir, "requests.jsonl")
     doc_path = os.path.join(args.output_dir, "docs.jsonl")
 
+    # Upper bound on the final prompt: the assembled sample is the doc verbatim
+    # plus the appended QA pairs, so we cap the doc at max_seq_length minus a
+    # reserve for those pairs. Measured with the chosen tokenizer.
+    max_doc_tokens = (args.max_seq_length - args.reserve_tokens
+                      if args.max_seq_length else None)
+    if max_doc_tokens is not None and max_doc_tokens <= args.chunk_tokens:
+        raise SystemExit(f"--max_seq_length {args.max_seq_length} too small for "
+                         f"--reserve_tokens {args.reserve_tokens} + a {args.chunk_tokens}-token chunk")
+
     n_docs = n_requests = 0
-    skipped_short = 0
+    skipped_short = skipped_long = 0
+    doc_tok_sum = 0
     with open(req_path, "w", encoding="utf-8") as rf, \
             open(doc_path, "w", encoding="utf-8") as df:
         for did, src, txt, _ntok in loader.iter_docs(
@@ -129,11 +139,17 @@ def prepare(args):
                 skipped_short += 1
                 continue
 
+            doc_tokens = count(txt)
+            if max_doc_tokens is not None and doc_tokens > max_doc_tokens:
+                skipped_long += 1
+                continue
+
             doc_local = f"mh-{n_docs:06d}"
             rng = random.Random(args.seed * 1_000_003 + n_docs)
+            doc_tok_sum += doc_tokens
             df.write(json.dumps(
                 {"doc": doc_local, "doc_id": did, "source": src,
-                 "n_chunks": len(chunks), "text": txt},
+                 "n_chunks": len(chunks), "doc_tokens": doc_tokens, "text": txt},
                 ensure_ascii=False) + "\n")
 
             for j in range(args.requests_per_doc):
@@ -158,6 +174,10 @@ def prepare(args):
         "requests": n_requests,
         "requests_per_doc": args.requests_per_doc,
         "skipped_too_few_chunks": skipped_short,
+        "skipped_too_long": skipped_long,
+        "max_seq_length": args.max_seq_length,
+        "max_doc_tokens": max_doc_tokens,
+        "avg_doc_tokens": round(doc_tok_sum / n_docs) if n_docs else 0,
         "chunk_tokens": args.chunk_tokens,
         "tokenizer": args.tokenizer,
         "seed": args.seed,
@@ -336,6 +356,12 @@ def main(argv=None):
                     help="skip docs that yield fewer than this many chunks")
     pp.add_argument("--tokenizer", default="whitespace",
                     help="hf:<name> | tiktoken[:enc] | whitespace")
+    pp.add_argument("--max_seq_length", type=int, default=None,
+                    help="cap on the final prompt; skip docs longer than "
+                         "max_seq_length - reserve_tokens (measured with --tokenizer). "
+                         "Unset = no upper bound (whole docs of any length)")
+    pp.add_argument("--reserve_tokens", type=int, default=2048,
+                    help="tokens held back from --max_seq_length for the appended QA pairs")
     pp.add_argument("--min_doc_tokens", type=int, default=2000, help="skip docs shorter than this")
     pp.add_argument("--min_edu", type=float, default=0.75)
     pp.add_argument("--keep_dups", action="store_true")

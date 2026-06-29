@@ -98,6 +98,12 @@ Response parsing auto-detects common engine schemas (our simple `{id, response}`
 OpenAI chat/batch `choices[].message.content`, vLLM, raw text fields), overridable
 via `--id_field` / `--text_field`.
 
+The final prompt is the source document verbatim (plus the small QA tail), so its
+length is the document's length — there is no synthesized budget to fit. Control it
+by **gating docs by length** at `prepare`: `--min_doc_tokens` (floor) and
+`--max_seq_length` (cap; skips any doc longer than `max_seq_length - --reserve_tokens`,
+measured with `--tokenizer`). Unset `--max_seq_length` = whole docs of any length.
+
 ## Shared framework
 
 `ruler_pp/base.py` defines `Sample` plus two task bases: `Task` (synthetic) and
