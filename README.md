@@ -104,6 +104,22 @@ by **gating docs by length** at `prepare`: `--min_doc_tokens` (floor) and
 `--max_seq_length` (cap; skips any doc longer than `max_seq_length - --reserve_tokens`,
 measured with `--tokenizer`). Unset `--max_seq_length` = whole docs of any length.
 
+**`summarize/` — long-context summarization (LLM-in-the-loop).** The same two-phase
+shape as `multihop`, simpler: one request per doc (summarization always succeeds, so
+no chunking or over-generation). `prepare` emits a **system + user** request per
+quality-filtered doc — the user turn is the **full document followed by the
+instruction**, i.e. the instruction sits *after* the long context (the
+long-context-friendly layout `mrcr`/`idk` also use, so the model reads the doc before
+seeing the task) — plus `docs.jsonl`. `assemble` takes each summary (stripping any
+`Here is the summary:` preamble / wrapping quotes), joins it to its doc, and writes
+`summarize.jsonl`:
+- **pt**: `text = "{doc}\n\n{instruction}\n{summary}"`;
+- **sft**: `messages = [{user: "{doc}\n\n{instruction}"}, {assistant: "{summary}"}]`.
+
+`--summary_words` adds a target length to the instruction; doc-length gating
+(`--min_doc_tokens` / `--max_seq_length` / `--reserve_tokens`) and response-schema
+auto-detection (`--id_field` / `--text_field`) work exactly as in `multihop`.
+
 ## Shared framework
 
 `ruler_pp/base.py` defines `Sample` plus two task bases: `Task` (synthetic) and
@@ -133,6 +149,8 @@ lc-pipeline/
     viz.py               Gradio viewer for the generated samples (python -m idk.viz)
   multihop/            multi-hop QA (LLM-in-the-loop, two phases)
     multihop.py          prepare (emit LLM requests) + assemble (stitch responses)
+  summarize/           long-context summarization (LLM-in-the-loop, two phases)
+    summarize.py         prepare (emit LLM requests) + assemble (stitch summaries)
   scripts/             utilities, checkers & one-off benchmarks
     download_finepdfs.py   pull the FinePDFs sample into finpdf_sample/
     verify_golds.py        independent re-checker for ruler++ golds
@@ -148,6 +166,7 @@ lc-pipeline/
   mrcr_out/            mrcr sample output (mrcr.jsonl)
   idk_out/             idk sample output (idk.jsonl)
   multihop_out/        multihop requests.jsonl + docs.jsonl, then multihop.jsonl
+  summarize_out/       summarize requests.jsonl + docs.jsonl, then summarize.jsonl
 ```
 
 ## Usage
@@ -190,6 +209,13 @@ python -m multihop prepare --input_dir finpdf_sample --output_dir multihop_out \
 # 2) run multihop_out/requests.jsonl through your engine -> responses.jsonl, then:
 python -m multihop assemble --requests_dir multihop_out \
     --responses responses.jsonl --format sft --max_pairs 10
+
+# summarize: long-context summarization, LLM-in-the-loop (one summary per doc)
+python -m summarize prepare --input_dir finpdf_sample --output_dir summarize_out \
+    --num_docs 500 --min_doc_tokens 4000 --summary_words 300
+# run summarize_out/requests.jsonl through your engine -> responses.jsonl, then:
+python -m summarize assemble --requests_dir summarize_out \
+    --responses responses.jsonl --format sft
 ```
 
 > Memory: the cluster source loads the text of every selected cluster's member
