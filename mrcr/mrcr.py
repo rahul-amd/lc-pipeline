@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import random
 import re
@@ -318,6 +319,72 @@ class MRCRTask:
 
 
 # --------------------------------------------------------------------------- #
+# sample builder + parallel workers
+# --------------------------------------------------------------------------- #
+def build_row(i, *, count, task, budget, size, seed, fmt, max_seq_length):
+    """Build one final sample row. Deterministic in `i` alone (seed-per-sample),
+    so this is safe to run in any order / across processes."""
+    rng = random.Random(seed * 1_000_003 + i)
+    cur = size
+    while True:
+        s = task.build(cur, rng)
+        length = count(s.input)
+        if length <= budget or cur <= task.min_size:
+            break
+        cur = max(task.min_size, int(cur * 0.9))
+    prompt = s.input
+    row = {
+        "id": f"mrcr-{i:06d}",
+        "task": "mrcr",
+        "format": fmt,
+        "input": prompt,
+        "instruction": s.instruction,
+        "context": s.context,
+        "question": s.question,
+        "answer_prefix": s.answer_prefix,
+        "answers": s.answers,
+        "gold": s.gold,
+        "answer_type": s.answer_type,
+        "length": length,
+        "max_seq_length": max_seq_length,
+        "seed": seed,
+        "meta": s.meta,
+    }
+    shape_row(row, fmt, prompt, s.answer_prefix, s.answer_text())
+    return row
+
+
+# Per-worker state (populated once by the pool initializer). The HF tokenizer is
+# not picklable, so each worker rebuilds it from the spec rather than receiving it.
+_W: dict = {}
+
+
+def _worker_init(tokenizer_spec, pool, markers, task_kwargs, budget, size, seed, fmt, max_seq_length):
+    # keep each worker single-threaded so N processes don't oversubscribe cores
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("RAYON_NUM_THREADS", "1")
+    tok = get_tokenizer(tokenizer_spec)
+    _W.update(
+        count=tok.count,
+        task=MRCRTask(pool, markers, **task_kwargs),
+        budget=budget, size=size, seed=seed, fmt=fmt, max_seq_length=max_seq_length,
+    )
+
+
+def _worker_build(i):
+    return build_row(
+        i, count=_W["count"], task=_W["task"], budget=_W["budget"], size=_W["size"],
+        seed=_W["seed"], fmt=_W["fmt"], max_seq_length=_W["max_seq_length"],
+    )
+
+
+def resolve_workers(n):
+    """0 / negative -> all cores; else the requested count (capped at cpu_count)."""
+    cpu = os.cpu_count() or 1
+    return cpu if n is None or n <= 0 else min(n, cpu)
+
+
+# --------------------------------------------------------------------------- #
 # driver
 # --------------------------------------------------------------------------- #
 def main(argv=None):
@@ -330,6 +397,9 @@ def main(argv=None):
     p.add_argument("--format", choices=["pt", "sft"], default="sft",
                    help="pt: flat 'text' field; sft: OpenAI 'messages' array")
     p.add_argument("--tokenizer", default="whitespace", help="hf:<name> | tiktoken[:enc] | whitespace")
+    p.add_argument("--workers", type=int, default=0,
+                   help="parallel sample-builder processes (0 = all CPU cores). "
+                        "Output is identical regardless of worker count.")
     # task shape
     p.add_argument("--k", type=int, default=2, help="markers conjoined by the query")
     p.add_argument("--confounder_frac", type=float, default=0.5,
@@ -379,36 +449,24 @@ def main(argv=None):
 
     os.makedirs(args.output_dir, exist_ok=True)
     out = os.path.join(args.output_dir, "mrcr.jsonl")
-    rows = []
-    for i in range(args.num_samples):
-        rng = random.Random(args.seed * 1_000_003 + i)
-        cur = size
-        while True:
-            s = task.build(cur, rng)
-            length = count(s.input)
-            if length <= budget or cur <= task.min_size:
-                break
-            cur = max(task.min_size, int(cur * 0.9))
-        prompt = s.input
-        row = {
-            "id": f"mrcr-{i:06d}",
-            "task": "mrcr",
-            "format": args.format,
-            "input": prompt,
-            "instruction": s.instruction,
-            "context": s.context,
-            "question": s.question,
-            "answer_prefix": s.answer_prefix,
-            "answers": s.answers,
-            "gold": s.gold,
-            "answer_type": s.answer_type,
-            "length": length,
-            "max_seq_length": args.max_seq_length,
-            "seed": args.seed,
-            "meta": s.meta,
-        }
-        shape_row(row, args.format, prompt, s.answer_prefix, s.answer_text())
-        rows.append(row)
+
+    workers = resolve_workers(args.workers)
+    task_kwargs = dict(k=args.k, confounder_frac=args.confounder_frac,
+                       neg_frac=args.neg_frac, min_size=args.min_size, reserve_tokens=reserve)
+    if workers <= 1 or args.num_samples <= 1:
+        print(f"generating {args.num_samples} samples (serial) ...")
+        rows = [build_row(i, count=count, task=task, budget=budget, size=size,
+                          seed=args.seed, fmt=args.format, max_seq_length=args.max_seq_length)
+                for i in range(args.num_samples)]
+    else:
+        print(f"generating {args.num_samples} samples across {workers} workers ...")
+        # fork inherits the loaded pool via copy-on-write (cheap); spawn re-pickles it.
+        ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context("spawn")
+        chunk = max(1, args.num_samples // (workers * 8))
+        initargs = (args.tokenizer, pool, markers, task_kwargs, budget, size,
+                    args.seed, args.format, args.max_seq_length)
+        with ctx.Pool(workers, initializer=_worker_init, initargs=initargs) as ppool:
+            rows = ppool.map(_worker_build, range(args.num_samples), chunksize=chunk)
 
     with open(out, "w", encoding="utf-8") as f:
         for r in rows:
@@ -424,6 +482,7 @@ def main(argv=None):
         "max_seq_length": args.max_seq_length,
         "pool_passages": len(pool),
         "k": args.k,
+        "workers": workers,
         "tokenizer": args.tokenizer,
         "format": args.format,
         "seed": args.seed,

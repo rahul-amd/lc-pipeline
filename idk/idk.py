@@ -34,11 +34,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import random
 import re
 
-from mrcr.mrcr import build_pool, load_markers
+from mrcr.mrcr import build_pool, load_markers, resolve_workers
 from ruler_pp.base import Sample
 from ruler_pp.cli import shape_row
 from ruler_pp.lengths import fit_size, get_tokenizer
@@ -192,6 +193,65 @@ class IDKTask:
 
 
 # --------------------------------------------------------------------------- #
+# sample builder + parallel workers
+# --------------------------------------------------------------------------- #
+def build_row(i, *, count, task, budget, size, seed, fmt, max_seq_length):
+    """Build one final sample row. Deterministic in `i` alone (seed-per-sample),
+    so this is safe to run in any order / across processes."""
+    rng = random.Random(seed * 1_000_003 + i)
+    cur = size
+    while True:
+        s = task.build(cur, rng)
+        length = count(s.input)
+        if length <= budget or cur <= task.min_size:
+            break
+        cur = max(task.min_size, int(cur * 0.9))
+    prompt = s.input
+    row = {
+        "id": f"idk-{i:06d}",
+        "task": "idk",
+        "format": fmt,
+        "input": prompt,
+        "instruction": s.instruction,
+        "context": s.context,
+        "question": s.question,
+        "answer_prefix": s.answer_prefix,
+        "answers": s.answers,
+        "gold": s.gold,
+        "answer_type": s.answer_type,
+        "length": length,
+        "max_seq_length": max_seq_length,
+        "seed": seed,
+        "meta": s.meta,
+    }
+    shape_row(row, fmt, prompt, s.answer_prefix, s.answer_text())
+    return row
+
+
+# Per-worker state (populated once by the pool initializer). The HF tokenizer is
+# not picklable, so each worker rebuilds it from the spec rather than receiving it.
+_W: dict = {}
+
+
+def _worker_init(tokenizer_spec, pool, markers, task_kwargs, budget, size, seed, fmt, max_seq_length):
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("RAYON_NUM_THREADS", "1")
+    tok = get_tokenizer(tokenizer_spec)
+    _W.update(
+        count=tok.count,
+        task=IDKTask(pool, markers, **task_kwargs),
+        budget=budget, size=size, seed=seed, fmt=fmt, max_seq_length=max_seq_length,
+    )
+
+
+def _worker_build(i):
+    return build_row(
+        i, count=_W["count"], task=_W["task"], budget=_W["budget"], size=_W["size"],
+        seed=_W["seed"], fmt=_W["fmt"], max_seq_length=_W["max_seq_length"],
+    )
+
+
+# --------------------------------------------------------------------------- #
 # driver
 # --------------------------------------------------------------------------- #
 def main(argv=None):
@@ -204,6 +264,9 @@ def main(argv=None):
     p.add_argument("--format", choices=["pt", "sft"], default="sft",
                    help="pt: flat 'text' field; sft: OpenAI 'messages' array")
     p.add_argument("--tokenizer", default="whitespace", help="hf:<name> | tiktoken[:enc] | whitespace")
+    p.add_argument("--workers", type=int, default=0,
+                   help="parallel sample-builder processes (0 = all CPU cores). "
+                        "Output is identical regardless of worker count.")
     # task shape
     p.add_argument("--n_choices", type=int, default=4, help="options incl. 'I don't know'")
     p.add_argument("--binding_frac", type=float, default=0.3,
@@ -243,9 +306,10 @@ def main(argv=None):
     if len(markers) < args.n_choices + 4:
         raise SystemExit(f"need more markers in res/markers.txt (have {len(markers)})")
 
-    task = IDKTask(pool, markers, n_choices=args.n_choices, binding_frac=args.binding_frac,
-                   unanswerable_frac=args.unanswerable_frac, subtle_frac=args.subtle_frac,
-                   min_size=args.min_size)
+    task_kwargs = dict(n_choices=args.n_choices, binding_frac=args.binding_frac,
+                       unanswerable_frac=args.unanswerable_frac, subtle_frac=args.subtle_frac,
+                       min_size=args.min_size)
+    task = IDKTask(pool, markers, **task_kwargs)
     budget = args.max_seq_length - task.reserve_tokens
 
     def measure(sz):
@@ -255,37 +319,26 @@ def main(argv=None):
 
     os.makedirs(args.output_dir, exist_ok=True)
     out = os.path.join(args.output_dir, "idk.jsonl")
-    rows, by_kind = [], {}
-    for i in range(args.num_samples):
-        rng = random.Random(args.seed * 1_000_003 + i)
-        cur = size
-        while True:
-            s = task.build(cur, rng)
-            length = count(s.input)
-            if length <= budget or cur <= task.min_size:
-                break
-            cur = max(task.min_size, int(cur * 0.9))
-        prompt = s.input
-        by_kind[s.meta["kind"]] = by_kind.get(s.meta["kind"], 0) + 1
-        row = {
-            "id": f"idk-{i:06d}",
-            "task": "idk",
-            "format": args.format,
-            "input": prompt,
-            "instruction": s.instruction,
-            "context": s.context,
-            "question": s.question,
-            "answer_prefix": s.answer_prefix,
-            "answers": s.answers,
-            "gold": s.gold,
-            "answer_type": s.answer_type,
-            "length": length,
-            "max_seq_length": args.max_seq_length,
-            "seed": args.seed,
-            "meta": s.meta,
-        }
-        shape_row(row, args.format, prompt, s.answer_prefix, s.answer_text())
-        rows.append(row)
+
+    workers = resolve_workers(args.workers)
+    if workers <= 1 or args.num_samples <= 1:
+        print(f"generating {args.num_samples} samples (serial) ...")
+        rows = [build_row(i, count=count, task=task, budget=budget, size=size,
+                          seed=args.seed, fmt=args.format, max_seq_length=args.max_seq_length)
+                for i in range(args.num_samples)]
+    else:
+        print(f"generating {args.num_samples} samples across {workers} workers ...")
+        ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context("spawn")
+        chunk = max(1, args.num_samples // (workers * 8))
+        initargs = (args.tokenizer, pool, markers, task_kwargs, budget, size,
+                    args.seed, args.format, args.max_seq_length)
+        with ctx.Pool(workers, initializer=_worker_init, initargs=initargs) as ppool:
+            rows = ppool.map(_worker_build, range(args.num_samples), chunksize=chunk)
+
+    by_kind: dict = {}
+    for r in rows:
+        k = r["meta"]["kind"]
+        by_kind[k] = by_kind.get(k, 0) + 1
 
     with open(out, "w", encoding="utf-8") as f:
         for r in rows:
@@ -301,6 +354,7 @@ def main(argv=None):
         "avg_len": round(avg),
         "max_seq_length": args.max_seq_length,
         "pool_passages": len(pool),
+        "workers": workers,
         "tokenizer": args.tokenizer,
         "format": args.format,
         "seed": args.seed,

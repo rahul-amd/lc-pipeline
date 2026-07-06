@@ -30,6 +30,12 @@ set -euo pipefail
 # Run from the repo root so `python -m corpus/untie/mrcr/idk/...` resolve.
 cd "$(dirname "$0")/.."
 
+# Fix the hash seed so set/dict ordering in the synthetic tasks (e.g. ruler++'s
+# variable_arithmetic does list(set(...))) is deterministic. This makes runs
+# reproducible AND makes parallel output byte-identical to serial on platforms
+# that use spawn (workers otherwise get their own random hash seed).
+export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
+
 # --------------------------------------------------------------------------- #
 # config (override any of these via the environment)
 # --------------------------------------------------------------------------- #
@@ -42,6 +48,10 @@ OUT="${OUT:-datagen_out}"                      # root output dir
 FORMAT="${FORMAT:-sft}"                        # pt | sft
 TOKENIZER="${TOKENIZER:-hf:Qwen/Qwen2.5-0.5B}" # exact budgets across generators
 SEED="${SEED:-42}"
+WORKERS="${WORKERS:-0}"                         # parallel builder procs per stage
+                                               # (0 = all CPU cores). Tokenizing
+                                               # long prompts is the bottleneck;
+                                               # this is the main speed knob.
 
 # Context-length buckets (tokens). Each generator's quota is split evenly here.
 LENGTHS=(8192 32768 131072 163840)
@@ -81,6 +91,15 @@ IDK_PER=$((   IDK_TOTAL   / NB ))                   # per bucket
 
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 
+# needs_gen DIR — succeeds (0) when DIR is missing or empty, i.e. we should
+# generate into it. Skips regeneration when a non-empty output dir already
+# exists, so reruns are idempotent and resume where they left off.
+needs_gen() {
+  local d="$1"
+  [ -d "$d" ] || return 0
+  [ -z "$(ls -A "$d" 2>/dev/null)" ]
+}
+
 log "config"
 cat <<EOF
   python        : $PYTHON   (emb: $EMB_PYTHON)
@@ -88,6 +107,7 @@ cat <<EOF
   out           : $OUT
   format        : $FORMAT
   tokenizer     : $TOKENIZER
+  workers       : $WORKERS (0 = all cores)   hashseed: $PYTHONHASHSEED
   lengths       : ${LENGTHS[*]}
   quotas        : ruler=$RULER_TOTAL untie=$UNTIE_TOTAL mrcr=$MRCR_TOTAL idk=$IDK_TOTAL
   per-bucket    : ruler/task=$RULER_PER  untie/flow=$UNTIE_PER  mrcr=$MRCR_PER  idk=$IDK_PER
@@ -100,6 +120,10 @@ mkdir -p "$OUT"
 if [ "$RUN_RULER" = "1" ]; then
   for i in "${!LENGTHS[@]}"; do
     L="${LENGTHS[$i]}"
+    if ! needs_gen "$OUT/ruler_pp/$L"; then
+      log "ruler++  len=$L  -> exists & non-empty, skipping"
+      continue
+    fi
     log "ruler++  len=$L  num_samples/task=$RULER_PER"
     "$PYTHON" -m ruler_pp \
       --task all \
@@ -107,6 +131,7 @@ if [ "$RUN_RULER" = "1" ]; then
       --num_samples "$RULER_PER" \
       --format "$FORMAT" \
       --tokenizer "$TOKENIZER" \
+      --workers "$WORKERS" \
       --seed "$(( SEED + i ))" \
       --output_dir "$OUT/ruler_pp/$L"
   done
@@ -127,6 +152,10 @@ if [ "$RUN_UNTIE" = "1" ]; then
 
   for i in "${!LENGTHS[@]}"; do
     L="${LENGTHS[$i]}"
+    if ! needs_gen "$OUT/untie/$L"; then
+      log "untie  context_len=$L  -> exists & non-empty, skipping"
+      continue
+    fi
     TPT=$(( L / 8 )); [ "$TPT" -lt 512 ] && TPT=512   # paragraph-unit tokens
     log "untie  context_len=$L  num_samples/flow=$UNTIE_PER  target_para_tokens=$TPT"
     "$PYTHON" -m untie \
@@ -143,6 +172,7 @@ if [ "$RUN_UNTIE" = "1" ]; then
       --max_clusters "$UNTIE_MAX_CLUSTERS" \
       --max_single_docs "$UNTIE_MAX_SINGLE" \
       --max_reuse "$UNTIE_MAX_REUSE" \
+      --workers "$WORKERS" \
       --seed "$(( SEED + i ))"
   done
 fi
@@ -153,6 +183,10 @@ fi
 if [ "$RUN_MRCR" = "1" ]; then
   for i in "${!LENGTHS[@]}"; do
     L="${LENGTHS[$i]}"
+    if ! needs_gen "$OUT/mrcr/$L"; then
+      log "mrcr  max_seq_length=$L  -> exists & non-empty, skipping"
+      continue
+    fi
     log "mrcr  max_seq_length=$L  num_samples=$MRCR_PER"
     "$PYTHON" -m mrcr \
       --input_dir "$INPUT_DIR" \
@@ -161,6 +195,7 @@ if [ "$RUN_MRCR" = "1" ]; then
       --num_samples "$MRCR_PER" \
       --format "$FORMAT" \
       --tokenizer "$TOKENIZER" \
+      --workers "$WORKERS" \
       --seed "$(( SEED + i ))"
   done
 fi
@@ -171,6 +206,10 @@ fi
 if [ "$RUN_IDK" = "1" ]; then
   for i in "${!LENGTHS[@]}"; do
     L="${LENGTHS[$i]}"
+    if ! needs_gen "$OUT/idk/$L"; then
+      log "idk  max_seq_length=$L  -> exists & non-empty, skipping"
+      continue
+    fi
     log "idk  max_seq_length=$L  num_samples=$IDK_PER"
     "$PYTHON" -m idk \
       --input_dir "$INPUT_DIR" \
@@ -179,6 +218,7 @@ if [ "$RUN_IDK" = "1" ]; then
       --num_samples "$IDK_PER" \
       --format "$FORMAT" \
       --tokenizer "$TOKENIZER" \
+      --workers "$WORKERS" \
       --seed "$(( SEED + i ))"
   done
 fi
@@ -195,26 +235,34 @@ if [ "$RUN_LLM_PREP" = "1" ]; then
     L="${LENGTHS[$i]}"
     if [ "$i" = "0" ]; then MIN_DOC=2000; else MIN_DOC="${LENGTHS[$(( i - 1 ))]}"; fi
 
-    log "multihop prepare  bucket=$L  min_doc_tokens=$MIN_DOC  docs=$MULTIHOP_DOCS"
-    "$PYTHON" -m multihop prepare \
-      --input_dir "$INPUT_DIR" \
-      --output_dir "$OUT/multihop/$L" \
-      --num_docs "$MULTIHOP_DOCS" \
-      --min_doc_tokens "$MIN_DOC" \
-      --max_seq_length "$L" \
-      --tokenizer "$TOKENIZER" \
-      --seed "$(( SEED + i ))"
+    if needs_gen "$OUT/multihop/$L"; then
+      log "multihop prepare  bucket=$L  min_doc_tokens=$MIN_DOC  docs=$MULTIHOP_DOCS"
+      "$PYTHON" -m multihop prepare \
+        --input_dir "$INPUT_DIR" \
+        --output_dir "$OUT/multihop/$L" \
+        --num_docs "$MULTIHOP_DOCS" \
+        --min_doc_tokens "$MIN_DOC" \
+        --max_seq_length "$L" \
+        --tokenizer "$TOKENIZER" \
+        --seed "$(( SEED + i ))"
+    else
+      log "multihop prepare  bucket=$L  -> exists & non-empty, skipping"
+    fi
 
-    log "summarize prepare  bucket=$L  min_doc_tokens=$MIN_DOC  docs=$SUMMARIZE_DOCS"
-    "$PYTHON" -m summarize prepare \
-      --input_dir "$INPUT_DIR" \
-      --output_dir "$OUT/summarize/$L" \
-      --num_docs "$SUMMARIZE_DOCS" \
-      --min_doc_tokens "$MIN_DOC" \
-      --max_seq_length "$L" \
-      --summary_words "$SUMMARIZE_WORDS" \
-      --tokenizer "$TOKENIZER" \
-      --seed "$(( SEED + i ))"
+    if needs_gen "$OUT/summarize/$L"; then
+      log "summarize prepare  bucket=$L  min_doc_tokens=$MIN_DOC  docs=$SUMMARIZE_DOCS"
+      "$PYTHON" -m summarize prepare \
+        --input_dir "$INPUT_DIR" \
+        --output_dir "$OUT/summarize/$L" \
+        --num_docs "$SUMMARIZE_DOCS" \
+        --min_doc_tokens "$MIN_DOC" \
+        --max_seq_length "$L" \
+        --summary_words "$SUMMARIZE_WORDS" \
+        --tokenizer "$TOKENIZER" \
+        --seed "$(( SEED + i ))"
+    else
+      log "summarize prepare  bucket=$L  -> exists & non-empty, skipping"
+    fi
   done
 fi
 
