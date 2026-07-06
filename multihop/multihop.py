@@ -190,14 +190,44 @@ def prepare(args):
 QA_RE = re.compile(r"Question:\s*(.*?)\s*Answer:\s*(.*)", re.DOTALL | re.IGNORECASE)
 
 
+def strip_thinking(text):
+    """Drop a thinking model's reasoning trace, returning only the final answer.
+
+    The generation prompt seeds the opening `<think>` tag, so the model's reply
+    starts *inside* the reasoning block (no leading `<think>` of its own) and
+    looks like `reasoning ... </think>answer`. We keep everything after the LAST
+    closing tag. Corner cases:
+      * no `</think>` at all -> the reply is an unterminated reasoning trace with
+        no answer to salvage, so return "" (it gets dropped downstream).
+      * empty / non-string input -> "".
+    """
+    if not isinstance(text, str) or not text:
+        return ""
+    if "</think>" not in text:
+        return ""
+    return text.split("</think>")[-1].strip()
+
+
 def extract_text(row, text_field=None):
     """Best-effort pull of the generated text from one response row.
 
-    Handles our simple schema and common engine outputs (OpenAI chat/batch, vLLM,
-    raw text fields). `text_field` forces a top-level key when given.
+    Primary schema is the thinking-model batch output: a top-level
+    `output_messages` list whose LAST entry's `content` holds the reply (with a
+    `<think>...</think>` prefix that we strip). Falls back to our simple schema
+    and common engine outputs (OpenAI chat/batch, vLLM, raw text fields).
+    `text_field` forces a top-level key when given. All paths run through
+    `strip_thinking` so reasoning traces never leak into the dataset.
     """
+    return strip_thinking(_extract_raw(row, text_field))
+
+
+def _extract_raw(row, text_field=None):
     if text_field:
         return row.get(text_field, "")
+    # thinking-model output: {"output_messages": [..., {"content": "<think>..</think>ans"}]}
+    om = row.get("output_messages")
+    if isinstance(om, list) and om and isinstance(om[-1], dict):
+        return om[-1].get("content", "") or ""
     for key in ("response", "completion", "output", "generated_text", "content", "text"):
         v = row.get(key)
         if isinstance(v, str) and v:
