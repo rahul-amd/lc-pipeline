@@ -30,6 +30,8 @@ class NumericAgg(Task):
 
         instruction = "Below is a numbered list of integers."
         question = f"Question: What is the {agg} of all the integers in the list?"
+        if agg == "mean":
+            question += " Round to two decimal places."
         return Sample(
             instruction, context, question,
             answer_prefix=f"The {agg} is",

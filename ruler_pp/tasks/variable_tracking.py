@@ -26,7 +26,7 @@ class VariableTracking(Task):
         names: set[str] = set()
         while len(names) < num_hops + 1:
             names.add(_new_var(rng))
-        names = list(names)
+        names = sorted(names)
         rng.shuffle(names)
 
         value = str(rng.randint(10000, 99999))

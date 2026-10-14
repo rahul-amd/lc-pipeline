@@ -1,0 +1,12 @@
+{
+  "tokenizer": "hf:Qwen/Qwen3-8B",
+  "model": "Qwen/Qwen3-8B",
+  "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+  "seed": 73,
+  "lengths": [8192, 32768],
+  "synthetic_samples_per_task": 2,
+  "corpus_samples": 6,
+  "requests_per_doc": 4,
+  "inference_max_tokens": 1536,
+  "workers": 2
+}

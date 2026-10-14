@@ -234,7 +234,7 @@ def main(data_dir="data"):
         mark = "OK " if p == n else "FAIL"
         print(f"  [{mark}] {t:22s} {p}/{n}")
     print(f"\nTOTAL: {ok}/{total} samples verified")
-    sys.exit(0 if ok == total else 1)
+    sys.exit(0 if total > 0 and ok == total else 1)
 
 
 if __name__ == "__main__":

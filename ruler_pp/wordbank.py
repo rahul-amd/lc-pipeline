@@ -55,15 +55,21 @@ def sample_words(n: int, rng) -> list[str]:
     pool = load_words()
     if n <= len(pool):
         return rng.sample(pool, n)
-    return [rng.choice(pool) for _ in range(n)]
+    # Preserve distinctness: common/top-k golds rely on disjoint vocabularies.
+    extra = coded_words(n - len(pool), rng, length=16)
+    out = list(pool) + extra
+    rng.shuffle(out)
+    return out
 
 
 def coded_words(n: int, rng, length: int = 6) -> list[str]:
     """`n` distinct synthetic words of random lowercase letters."""
+    if n < 0 or n > 26 ** length:
+        raise ValueError("requested coded vocabulary exceeds available unique words")
     s: set[str] = set()
     while len(s) < n:
         s.add("".join(rng.choices(string.ascii_lowercase, k=length)))
-    out = list(s)
+    out = sorted(s)
     rng.shuffle(out)
     return out
 

@@ -27,6 +27,10 @@ class FreqWords(Task):
         ranks = np.arange(1, len(vocab) + 1)
         counts = (size * (ranks ** -alpha) / zeta(alpha)).astype(int)
 
+        # Integer rounding can tie the third real word with the tail at small sizes.
+        for rank in (3, 2, 1):
+            counts[rank] = max(counts[rank], counts[rank + 1] + 1)
+
         stream: list[str] = []
         for w, c in zip(vocab, counts):
             stream.extend([w] * int(c))

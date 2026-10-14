@@ -40,9 +40,11 @@ import random
 import re
 
 from corpus import loader
+from corpus.chunks import split_text
 from ruler_pp.base import CorpusTask, Sample
 from ruler_pp.cli import resolve_workers, shape_row
 from ruler_pp.lengths import get_tokenizer
+from ruler_pp.output import finalize_row, training_length
 
 PARA_SPLIT = re.compile(r"\n\s*\n+")
 SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
@@ -89,15 +91,12 @@ def make_units(text, count, target_para_tokens, max_para_tokens, rng, jitter=0.0
     if len(paras) < 2:
         paras = [p.strip() for p in SENT_SPLIT.split(text) if p.strip()]
 
-    win_words = max(1, round(target_para_tokens * 0.75))
     split_paras = []
     for p in paras:
         if count(p) <= max_para_tokens:
             split_paras.append(p)
             continue
-        words = p.split()
-        for i in range(0, len(words), win_words):
-            split_paras.append(" ".join(words[i:i + win_words]))
+        split_paras.extend(split_text(p, count, max_para_tokens))
 
     def next_target():
         if jitter <= 0:
@@ -109,12 +108,12 @@ def make_units(text, count, target_para_tokens, max_para_tokens, rng, jitter=0.0
     for p in split_paras:
         pt = count(p)
         if buf and buf_tok + pt > cur_target:
-            units.append(("\n\n".join(buf), buf_tok))
+            units.append(("\n\n".join(buf), count("\n\n".join(buf))))
             buf, buf_tok, cur_target = [], 0, next_target()
         buf.append(p)
         buf_tok += pt
     if buf:
-        units.append(("\n\n".join(buf), buf_tok))
+        units.append(("\n\n".join(buf), count("\n\n".join(buf))))
     return units
 
 
@@ -268,6 +267,18 @@ def compute_source(sidx, src_id, text, *, flows, samples_per_doc, tasks, count, 
             if s is None:
                 items.append((flow, None))
                 continue
+            # Fit the actual serialized answer too; reconstruct duplicates the text.
+            trial = shape_row({"format": fmt}, fmt, s.input, s.answer_prefix, s.answer_text())
+            trial_units = units
+            while training_length(trial, count)[0] > context_len and len(trial_units) > min_units:
+                trial_units = trial_units[:max(min_units, int(len(trial_units) * 0.9))]
+                s = tasks[flow].build(trial_units, random.Random(seed_i))
+                if s is None:
+                    break
+                trial = shape_row({"format": fmt}, fmt, s.input, s.answer_prefix, s.answer_text())
+            if s is None or training_length(trial, count)[0] > context_len:
+                items.append((flow, None))
+                continue
             prompt = s.input
             length = count(prompt)
             row = {
@@ -289,6 +300,7 @@ def compute_source(sidx, src_id, text, *, flows, samples_per_doc, tasks, count, 
                 "meta": s.meta,
             }
             shape_row(row, fmt, prompt, s.answer_prefix, s.answer_text())
+            finalize_row(row, count, context_len)
             items.append((flow, row))
     return {"units_ok": True, "src_id": src_id, "items": items}
 
@@ -362,13 +374,21 @@ def main(argv=None):
 
     flows = [f.strip() for f in args.flows.split(",") if f.strip()]
     sources = [s.strip() for s in args.sources.split(",") if s.strip()]
+    if not flows or set(flows) - INSTR.keys() or len(flows) != len(set(flows)):
+        p.error("flows must be unique values from reconstruct,permutation")
+    if not sources or set(sources) - {"single", "cluster"}:
+        p.error("sources must be cluster and/or single")
+    if min(args.context_len, args.min_units, args.target_para_tokens, args.samples_per_doc) < 1:
+        p.error("length, units and samples must be positive")
+    if args.num_samples is not None and args.num_samples < 1:
+        p.error("num_samples must be positive")
     max_para_tokens = args.max_para_tokens or args.target_para_tokens
     rng = random.Random(args.seed)
     tokenizer = get_tokenizer(args.tokenizer)
     tasks = {f: UntieKnots(f, args.context_len, args.min_units) for f in flows}
 
     os.makedirs(args.output_dir, exist_ok=True)
-    writers = {f: open(os.path.join(args.output_dir, f"{f}.jsonl"), "w", encoding="utf-8")
+    writers = {f: open(os.path.join(args.output_dir, f".{f}.jsonl.tmp"), "w", encoding="utf-8")
                for f in flows}
     counts = {f: 0 for f in flows}
     counts["skipped"] = 0
@@ -508,6 +528,11 @@ def main(argv=None):
         "seed": args.seed,
     }
     print(json.dumps(summary, indent=2))
+    if not total or (target is not None and not all_done()):
+        raise SystemExit("generation did not meet the requested sample target")
+    for flow in flows:
+        os.replace(os.path.join(args.output_dir, f".{flow}.jsonl.tmp"),
+                   os.path.join(args.output_dir, f"{flow}.jsonl"))
 
 
 if __name__ == "__main__":
