@@ -41,7 +41,8 @@ import re
 
 from mrcr.mrcr import build_pool, load_markers, resolve_workers
 from ruler_pp.base import Sample
-from ruler_pp.cli import shape_row
+from ruler_pp.cli import shape_row, resolve_workers
+from ruler_pp.output import finalize_row, training_length, write_jsonl
 from ruler_pp.lengths import fit_size, get_tokenizer
 
 IDK = "I don't know"
@@ -79,9 +80,15 @@ class IDKTask:
                  min_size=8, reserve_tokens=16):
         if not 0.0 <= unanswerable_frac <= 1.0:
             raise ValueError("unanswerable_frac must be in [0, 1]")
-        if subtle_frac > unanswerable_frac:
+        if not 0 <= subtle_frac <= unanswerable_frac:
             raise ValueError("subtle_frac cannot exceed unanswerable_frac")
-        self.pool = pool
+        if not 2 <= n_choices <= 26 or min_size < max(n_choices, 4):
+            raise ValueError("need 2..26 choices and min_size >= max(n_choices, 4)")
+        if not 0 <= binding_frac <= 1 or len(set(markers)) < max(n_choices, 4) + 1 or not attributes:
+            raise ValueError("invalid binding fraction, marker vocabulary or attributes")
+        self.pool = [p for p in pool if not BINDING_RE.search(p)]
+        if not self.pool:
+            raise ValueError("no passages without conflicting source bindings")
         self.markers = markers
         self.attributes = attributes
         self.n_choices = n_choices
@@ -203,8 +210,11 @@ def build_row(i, *, count, task, budget, size, seed, fmt, max_seq_length):
     while True:
         s = task.build(cur, rng)
         length = count(s.input)
-        if length <= budget or cur <= task.min_size:
+        candidate = shape_row({"format": fmt}, fmt, s.input, s.answer_prefix, s.answer_text())
+        if training_length(candidate, count)[0] <= max_seq_length:
             break
+        if cur <= task.min_size:
+            raise ValueError(f"{task.name}: minimum sample does not fit {max_seq_length} tokens")
         cur = max(task.min_size, int(cur * 0.9))
     prompt = s.input
     row = {
@@ -225,7 +235,7 @@ def build_row(i, *, count, task, budget, size, seed, fmt, max_seq_length):
         "meta": s.meta,
     }
     shape_row(row, fmt, prompt, s.answer_prefix, s.answer_text())
-    return row
+    return finalize_row(row, count, max_seq_length)
 
 
 # Per-worker state (populated once by the pool initializer). The HF tokenizer is
@@ -288,6 +298,8 @@ def main(argv=None):
     p.add_argument("--max_docs", type=int, default=None, help="cap docs scanned while filling the pool")
     args = p.parse_args(argv)
 
+    if args.num_samples < 1 or args.max_seq_length < 1 or args.pool_size < 1:
+        p.error("num_samples, max_seq_length and pool_size must be positive")
     tokenizer = get_tokenizer(args.tokenizer)
     count = tokenizer.count
 
@@ -310,10 +322,12 @@ def main(argv=None):
                        unanswerable_frac=args.unanswerable_frac, subtle_frac=args.subtle_frac,
                        min_size=args.min_size)
     task = IDKTask(pool, markers, **task_kwargs)
-    budget = args.max_seq_length - task.reserve_tokens
+    budget = args.max_seq_length
 
     def measure(sz):
-        return count(task.build(sz, random.Random(args.seed)).input)
+        s = task.build(sz, random.Random(args.seed))
+        row = shape_row({"format": args.format}, args.format, s.input, s.answer_prefix, s.answer_text())
+        return training_length(row, count)[0]
 
     size = fit_size(measure, budget, task.min_size)
 
@@ -323,32 +337,35 @@ def main(argv=None):
     workers = resolve_workers(args.workers)
     if workers <= 1 or args.num_samples <= 1:
         print(f"generating {args.num_samples} samples (serial) ...")
-        rows = [build_row(i, count=count, task=task, budget=budget, size=size,
+        rows = (build_row(i, count=count, task=task, budget=budget, size=size,
                           seed=args.seed, fmt=args.format, max_seq_length=args.max_seq_length)
-                for i in range(args.num_samples)]
+                for i in range(args.num_samples))
     else:
         print(f"generating {args.num_samples} samples across {workers} workers ...")
         ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context("spawn")
         chunk = max(1, args.num_samples // (workers * 8))
         initargs = (args.tokenizer, pool, markers, task_kwargs, budget, size,
                     args.seed, args.format, args.max_seq_length)
-        with ctx.Pool(workers, initializer=_worker_init, initargs=initargs) as ppool:
-            rows = ppool.map(_worker_build, range(args.num_samples), chunksize=chunk)
+        def parallel_rows():
+            with ctx.Pool(workers, initializer=_worker_init, initargs=initargs) as ppool:
+                yield from ppool.imap(_worker_build, range(args.num_samples), chunksize=min(chunk, 8))
+        rows = parallel_rows()
 
-    by_kind: dict = {}
-    for r in rows:
-        k = r["meta"]["kind"]
-        by_kind[k] = by_kind.get(k, 0) + 1
-
-    with open(out, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-    avg = sum(r["length"] for r in rows) / len(rows)
+    by_kind = {}
+    totals = [0, 0]
+    def measured_rows():
+        for row in rows:
+            totals[0] += row["length"]
+            totals[1] += 1
+            kind = row["meta"].get("kind", "mrcr")
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+            yield row
+    write_jsonl(out, measured_rows())
+    avg = totals[0] / totals[1]
     summary = {
         "output_dir": args.output_dir,
         "file": out,
-        "samples": len(rows),
+        "samples": totals[1],
         "by_kind": by_kind,
         "fitted_size": size,
         "avg_len": round(avg),

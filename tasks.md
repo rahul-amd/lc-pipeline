@@ -203,27 +203,25 @@ matching. Knowing *when not to answer* is a core long-context reliability proper
 
 ### 2e. `multihop` — multi-hop QA (LLM-in-the-loop)
 
-The only generators that need an LLM to *write* the data run in two offline phases; the
-repo never calls the model. **`prepare`** chunks each doc into ~512-token chunks and, per
+The LLM-authored generators use prepare, inference, and assemble. Inference can
+use an external dispatcher or the built-in `corpus.infer` API client. **`prepare`** chunks each doc into ~512-token chunks and, per
 doc, emits several requests (default 13, over-generated against an 8–10 pair target),
 each sampling 3–4 **random** chunks. The system prompt asks for **one** QA pair whose
-answer needs a fact from *every* chunk shown (true multi-hop, not answerable from any
-single chunk), with the exact fallback phrase `cannot generate` when the chunks share no
+answer needs a fact from *every* chunk shown (a requested property, not a guarantee), with the exact fallback phrase `cannot generate` when the chunks share no
 usable common ground. **`assemble`** parses `Question:/Answer:` from the engine's
 responses (dropping `cannot generate`), regroups per doc, and emits the final record
 (`pt`: `doc\n\nQuestion:…Answer:…`; `sft`: numbered questions → numbered answers). The
 final training context is the **whole document**.
 
-*Long-context skill:* **multi-hop synthesis across dispersed regions**. By construction,
-each answer requires combining facts from chunks that sit far apart in the document, so
-the model is trained to integrate information across the long context rather than
-retrieve a single span. Over-generation + the `cannot generate` escape hatch keep the
-kept pairs genuinely multi-hop (low-overlap chunk sets are discarded, not forced).
+*Intended long-context skill:* **multi-hop synthesis across dispersed regions**.
+The prompt asks the authoring model to combine necessary facts from every chunk,
+but neither over-generation nor abstention proves that the retained questions
+need multiple chunks. Grounding and chunk-necessity evaluation remain required.
 
 ### 2f. `summarize` — long-context summarization (LLM-in-the-loop)
 
-Same two-phase shape as `multihop`, but simpler: **one request per doc** (summarization
-always succeeds — no chunking, no over-generation). `prepare` sends the **full document
+Same prepare/inference/assemble shape as `multihop`, but simpler: **one request per
+doc**, without chunking or over-generation. Faithfulness still needs evaluation. `prepare` sends the **full document
 followed by the instruction** (instruction *at the end*, after the long context — the
 layout `mrcr`/`idk` also use, so the model reads the doc before seeing the task);
 `--summary_words` can set a target length. `assemble` cleans each summary (strips a stray

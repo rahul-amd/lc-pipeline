@@ -1,8 +1,8 @@
 """Multi-hop QA generation over FinePDFs documents (LLM-in-the-loop, two phases).
 
 Unlike the other generators, this one needs an LLM to *write* the questions, so it
-is split into two offline phases with the inference run in between (we never call
-the model ourselves):
+is split into prepare and assemble with inference in between. Use an external
+dispatcher or `python -m corpus.infer` for an OpenAI-compatible endpoint:
 
   prepare   chunk each document into ~512-token chunks, sample a few chunks per
             request, and emit a `messages` array per request to `requests.jsonl`
@@ -28,13 +28,15 @@ roughly the target number of pairs.
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import random
 import re
 
 from corpus import loader
+from corpus.llm import (assembly_arguments, document_key, load_bundle, load_jsonl,
+                        publish, save_manifest)
+from corpus.chunks import split_text
 from ruler_pp.lengths import get_tokenizer
 
 # --------------------------------------------------------------------------- #
@@ -86,29 +88,25 @@ def chunk_doc(text, count, *, chunk_tokens, min_chunk_tokens):
     """Greedily pack a document's words into ~`chunk_tokens`-token chunks.
 
     Measured with the chosen tokenizer so the target holds for sub-word encoders
-    too (for the whitespace tokenizer it is exactly `chunk_tokens` words). A
+    too, preserving source line breaks. A
     trailing chunk shorter than `min_chunk_tokens` is dropped.
     """
-    words = text.split()
-    n = len(words)
-    chunks = []
-    i = 0
-    step = max(1, chunk_tokens // 4)
-    while i < n:
-        hi = min(n, i + chunk_tokens)  # whitespace: already on target
-        while hi < n and count(" ".join(words[i:hi])) < chunk_tokens:
-            hi = min(n, hi + step)
-        chunk = " ".join(words[i:hi])
-        if count(chunk) >= min_chunk_tokens:
-            chunks.append(chunk)
-        i = hi
-    return chunks
+    if not 1 <= min_chunk_tokens <= chunk_tokens:
+        raise ValueError("need 1 <= min_chunk_tokens <= chunk_tokens")
+    return [chunk for chunk in split_text(text, count, chunk_tokens)
+            if count(chunk) >= min_chunk_tokens]
 
 
 # --------------------------------------------------------------------------- #
 # phase A: prepare requests
 # --------------------------------------------------------------------------- #
 def prepare(args):
+    for key in ("num_docs", "max_docs", "max_seq_length"):
+        value = getattr(args, key, None)
+        if value is not None and value < 1:
+            raise ValueError(f"{key} must be positive")
+    if args.reserve_tokens < 0:
+        raise ValueError("reserve_tokens cannot be negative")
     tokenizer = get_tokenizer(args.tokenizer)
     count = tokenizer.count
 
@@ -125,13 +123,15 @@ def prepare(args):
         raise SystemExit(f"--max_seq_length {args.max_seq_length} too small for "
                          f"--reserve_tokens {args.reserve_tokens} + a {args.chunk_tokens}-token chunk")
 
+    if not 2 <= args.min_chunks <= args.max_chunks or args.min_doc_chunks < args.min_chunks or args.requests_per_doc < 1:
+        raise ValueError("require 2 <= min_chunks <= max_chunks, min_doc_chunks >= min_chunks, positive requests_per_doc")
     n_docs = n_requests = 0
     skipped_short = skipped_long = 0
     doc_tok_sum = 0
     with open(req_path, "w", encoding="utf-8") as rf, \
             open(doc_path, "w", encoding="utf-8") as df:
         for did, src, txt, _ntok in loader.iter_docs(
-                args.input_dir, min_tokens=args.min_doc_tokens, min_edu=args.min_edu,
+                args.input_dir, min_tokens=0, min_edu=args.min_edu,
                 drop_dups=not args.keep_dups, max_docs=args.max_docs):
             chunks = chunk_doc(txt, count, chunk_tokens=args.chunk_tokens,
                                min_chunk_tokens=args.min_chunk_tokens)
@@ -140,11 +140,13 @@ def prepare(args):
                 continue
 
             doc_tokens = count(txt)
+            if doc_tokens < args.min_doc_tokens:
+                continue
             if max_doc_tokens is not None and doc_tokens > max_doc_tokens:
                 skipped_long += 1
                 continue
 
-            doc_local = f"mh-{n_docs:06d}"
+            doc_local = document_key("mh", did, txt, args)
             rng = random.Random(args.seed * 1_000_003 + n_docs)
             doc_tok_sum += doc_tokens
             df.write(json.dumps(
@@ -165,6 +167,7 @@ def prepare(args):
             if args.num_docs and n_docs >= args.num_docs:
                 break
 
+    save_manifest(args, n_docs, n_requests)
     print(json.dumps({
         "phase": "prepare",
         "output_dir": args.output_dir,
@@ -191,21 +194,18 @@ QA_RE = re.compile(r"Question:\s*(.*?)\s*Answer:\s*(.*)", re.DOTALL | re.IGNOREC
 
 
 def strip_thinking(text):
-    """Drop a thinking model's reasoning trace, returning only the final answer.
+    """Keep plain answers and remove complete reasoning blocks.
 
-    The generation prompt seeds the opening `<think>` tag, so the model's reply
-    starts *inside* the reasoning block (no leading `<think>` of its own) and
-    looks like `reasoning ... </think>answer`. We keep everything after the LAST
-    closing tag. Corner cases:
-      * no `</think>` at all -> the reply is an unterminated reasoning trace with
-        no answer to salvage, so return "" (it gets dropped downstream).
-      * empty / non-string input -> "".
+    A visible opening tag without a closing tag is incomplete, not an answer.
+    Legacy prompts that seed the opening tag may emit only the closing tag.
     """
     if not isinstance(text, str) or not text:
         return ""
-    if "</think>" not in text:
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1]
+    if "<think>" in text:
         return ""
-    return text.split("</think>")[-1].strip()
+    return text.strip()
 
 
 def extract_text(row, text_field=None):
@@ -263,91 +263,56 @@ def parse_pair(text):
     t = (text or "").strip()
     if not t or t.lower().startswith(CANNOT):
         return None
-    m = QA_RE.search(t)
+    m = QA_RE.fullmatch(t)
     if not m:
         return None
     q, a = m.group(1).strip(), m.group(2).strip()
-    if not q or not a or a.lower().startswith(CANNOT):
+    if not q or not a or a.lower().startswith(CANNOT) or re.search(r"(?im)^Question:", a):
         return None
     return q, a
 
 
-def load_jsonl(path):
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
-
-
 def assemble(args):
-    docs = {r["doc"]: r for r in load_jsonl(os.path.join(args.requests_dir, "docs.jsonl"))}
-    req_to_doc = {r["id"]: r["doc"]
-                  for r in load_jsonl(os.path.join(args.requests_dir, "requests.jsonl"))}
-
-    resp_files = sorted(glob.glob(args.responses)) if any(c in args.responses for c in "*?[") \
-        else [args.responses]
-    if not resp_files:
-        raise SystemExit(f"no response files matched {args.responses!r}")
-
-    pairs_by_doc = {}        # doc_local -> [(q, a), ...] in request order
-    n_resp = n_pairs = n_cannot = n_unmatched = 0
-    for path in resp_files:
-        for row in load_jsonl(path):
-            n_resp += 1
-            rid = row.get(args.id_field) or row.get("id") or row.get("custom_id")
-            doc = req_to_doc.get(rid)
-            if doc is None:
-                n_unmatched += 1
-                continue
-            pair = parse_pair(extract_text(row, args.text_field))
-            if pair is None:
-                n_cannot += 1
-                continue
-            order = int(rid.rsplit("-q", 1)[1]) if "-q" in rid else len(pairs_by_doc.get(doc, []))
-            pairs_by_doc.setdefault(doc, []).append((order, pair))
-            n_pairs += 1
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    out = os.path.join(args.output_dir, "multihop.jsonl")
-    kept_docs = dropped_docs = kept_pairs = 0
-    with open(out, "w", encoding="utf-8") as f:
-        for doc in sorted(pairs_by_doc):
-            qas = [p for _o, p in sorted(pairs_by_doc[doc], key=lambda t: t[0])]
-            qas = qas[:args.max_pairs]
-            if len(qas) < args.min_pairs:
-                dropped_docs += 1
-                continue
-            meta_doc = docs.get(doc, {})
-            text = meta_doc.get("text", "")
-            row = {
-                "id": doc,
-                "task": "multihop",
-                "format": args.format,
-                "doc_id": meta_doc.get("doc_id"),
-                "source": meta_doc.get("source"),
-                "n_pairs": len(qas),
-                "qa_pairs": [{"question": q, "answer": a} for q, a in qas],
-            }
-            shape_multihop(row, args.format, text, qas)
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            kept_docs += 1
-            kept_pairs += len(qas)
-
-    print(json.dumps({
-        "phase": "assemble",
-        "output_dir": args.output_dir,
-        "file": out,
-        "responses_read": n_resp,
-        "pairs_parsed": n_pairs,
-        "cannot_generate_or_unparsed": n_cannot,
-        "unmatched_ids": n_unmatched,
-        "docs_written": kept_docs,
-        "docs_dropped_below_min": dropped_docs,
-        "pairs_written": kept_pairs,
-        "avg_pairs_per_doc": round(kept_pairs / kept_docs, 2) if kept_docs else 0,
-        "format": args.format,
-    }, indent=2))
+    if not 1 <= args.min_pairs <= args.max_pairs:
+        raise ValueError("require 1 <= min_pairs <= max_pairs")
+    docs, requests, responses, tokenizer, limit, missing = load_bundle(args)
+    pairs_by_doc = {}
+    questions_by_doc = {}
+    abstentions = duplicates = 0
+    for rid, request in requests.items():
+        if rid not in responses:
+            continue
+        text = extract_text(responses[rid], args.text_field)
+        if text.strip().lower() == CANNOT:
+            abstentions += 1
+            continue
+        pair = parse_pair(text)
+        if pair is None:
+            raise ValueError(f"malformed QA response: {rid}")
+        pairs = pairs_by_doc.setdefault(request["doc"], [])
+        questions = questions_by_doc.setdefault(request["doc"], set())
+        question_key = " ".join(pair[0].casefold().split())
+        if question_key not in questions:
+            pairs.append(pair)
+            questions.add(question_key)
+        else:
+            duplicates += 1
+    rows = []
+    for doc, qas in pairs_by_doc.items():
+        qas = qas[:args.max_pairs]
+        if len(qas) < args.min_pairs:
+            continue
+        source = docs[doc]
+        row = {"id": doc, "task": "multihop", "format": args.format,
+               "doc_id": source["doc_id"], "source": source["source"],
+               "n_pairs": len(qas),
+               "qa_pairs": [{"question": q, "answer": a} for q, a in qas]}
+        shape_multihop(row, args.format, source["text"], qas)
+        rows.append(row)
+    publish(args, "multihop", rows, tokenizer, limit,
+            {"responses": len(responses), "missing": missing, "abstentions": abstentions,
+             "duplicate_pairs": duplicates, "docs_without_pairs": len(docs) - len(rows),
+             "quality_note": "Format checked; grounding and multi-hop necessity are not verified."})
 
 
 def shape_multihop(row, fmt, doc, qas):
@@ -411,6 +376,7 @@ def main(argv=None):
     pa.add_argument("--min_pairs", type=int, default=1, help="drop docs with fewer valid pairs")
     pa.add_argument("--id_field", default=None, help="response key holding the request id")
     pa.add_argument("--text_field", default=None, help="response key holding the generated text")
+    assembly_arguments(pa)
     pa.set_defaults(func=assemble)
 
     args = p.parse_args(argv)

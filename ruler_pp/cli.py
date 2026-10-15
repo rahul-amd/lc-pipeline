@@ -19,11 +19,13 @@ from datetime import datetime
 
 from .lengths import fit_size, get_tokenizer
 from .registry import TASKS, get_task
+from .output import finalize_row, training_length, write_jsonl
 
 
 def resolve_workers(n):
     """0 / negative -> all cores; else the requested count (capped at cpu_count)."""
-    cpu = os.cpu_count() or 1
+    cpu = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    cpu = min(cpu, int(os.environ.get("SLURM_CPUS_PER_TASK", cpu)))
     return cpu if n is None or n <= 0 else min(n, cpu)
 
 
@@ -63,8 +65,11 @@ def build_task_row(i, *, task, count, fewshot_block, budget, size, seed,
     while True:
         s = task.build(cur, rng)
         length = count(_prompt(fewshot_block, s))
-        if length <= budget or cur <= task.min_size:
+        candidate = shape_row({"format": fmt}, fmt, fewshot_block + s.input, s.answer_prefix, s.answer_text())
+        if training_length(candidate, count)[0] <= max_seq_length:
             break
+        if cur <= task.min_size:
+            raise ValueError(f"{task.name}: minimum sample does not fit {max_seq_length} tokens")
         cur = max(task.min_size, int(cur * 0.9))
     prompt = fewshot_block + s.input
     row = {
@@ -85,7 +90,8 @@ def build_task_row(i, *, task, count, fewshot_block, budget, size, seed,
         "seed": seed,
         "meta": s.meta,
     }
-    return shape_row(row, fmt, prompt, s.answer_prefix, s.answer_text())
+    shape_row(row, fmt, prompt, s.answer_prefix, s.answer_text())
+    return finalize_row(row, count, max_seq_length)
 
 
 # Per-worker state. The HF tokenizer isn't picklable and tasks are cheap to
@@ -111,37 +117,35 @@ def _worker_build(i):
 
 
 def generate_task(task, tokenizer, n, max_seq_length, seed, num_fewshot, fmt,
-                  *, tokenizer_spec=None, workers=1):
+                  *, tokenizer_spec=None, workers=1, stream=False):
     fewshot_block = task.fewshot(random.Random(seed * 7 + 1), num_fewshot)
-    budget = max_seq_length - task.reserve_tokens
+    if n < 1 or max_seq_length < 1 or num_fewshot < 0:
+        raise ValueError("num_samples and max_seq_length must be positive; num_fewshot nonnegative")
+    budget = max_seq_length
 
     def measure(size: int) -> int:
         s = task.build(size, random.Random(seed))
-        return tokenizer.count(_prompt(fewshot_block, s))
+        row = shape_row({"format": fmt}, fmt, fewshot_block + s.input, s.answer_prefix, s.answer_text())
+        return training_length(row, tokenizer.count)[0]
 
     size = fit_size(measure, budget, task.min_size)
 
     workers = resolve_workers(workers)
     if workers <= 1 or n <= 1 or not tokenizer_spec:
-        rows = [build_task_row(i, task=task, count=tokenizer.count,
+        rows = (build_task_row(i, task=task, count=tokenizer.count,
                                fewshot_block=fewshot_block, budget=budget, size=size,
                                seed=seed, max_seq_length=max_seq_length,
-                               num_fewshot=num_fewshot, fmt=fmt) for i in range(n)]
+                               num_fewshot=num_fewshot, fmt=fmt) for i in range(n))
     else:
         ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context("spawn")
         chunk = max(1, n // (workers * 8))
         initargs = (tokenizer_spec, task.name, fewshot_block, budget, size, seed,
                     max_seq_length, num_fewshot, fmt)
-        with ctx.Pool(workers, initializer=_worker_init, initargs=initargs) as ppool:
-            rows = ppool.map(_worker_build, range(n), chunksize=chunk)
-    return rows, size
-
-
-def write_jsonl(path, rows):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        def parallel_rows():
+            with ctx.Pool(workers, initializer=_worker_init, initargs=initargs) as ppool:
+                yield from ppool.imap(_worker_build, range(n), chunksize=min(chunk, 8))
+        rows = parallel_rows()
+    return (rows if stream else list(rows)), size
 
 
 def main(argv=None):
@@ -177,11 +181,17 @@ def main(argv=None):
         rows, size = generate_task(
             task, tokenizer, args.num_samples, args.max_seq_length,
             args.seed, args.num_fewshot, args.format,
-            tokenizer_spec=args.tokenizer, workers=args.workers,
+            tokenizer_spec=args.tokenizer, workers=args.workers, stream=True,
         )
         out = os.path.join(output_dir, f"{name}.jsonl")
-        write_jsonl(out, rows)
-        avg = sum(r["length"] for r in rows) / len(rows)
+        totals = [0, 0]
+        def measured_rows():
+            for row in rows:
+                totals[0] += row["length"]
+                totals[1] += 1
+                yield row
+        write_jsonl(out, measured_rows())
+        avg = totals[0] / totals[1]
         print(f"{name:22s} size={size:<7d} avg_len={avg:7.0f}/{args.max_seq_length}  -> {out}")
 
 

@@ -42,8 +42,10 @@ import random
 import re
 
 from corpus import loader
+from corpus.chunks import split_text
 from ruler_pp.base import Sample
-from ruler_pp.cli import shape_row
+from ruler_pp.cli import shape_row, resolve_workers
+from ruler_pp.output import finalize_row, training_length, write_jsonl
 from ruler_pp.lengths import fit_size, get_tokenizer
 
 PARA_SPLIT = re.compile(r"\n\s*\n+")
@@ -160,11 +162,9 @@ def iter_passages(input_dir, count, *, target_tokens, min_tokens, max_tokens,
                     if buftok >= min_tokens and ok(cand):
                         yield cand
                     buf, buftok = [], 0
-                words = p.split()
-                win = max(1, round(target_tokens * 0.9))
-                for i in range(0, len(words), win):
-                    chunk = " ".join(words[i:i + win])
-                    if count(chunk) >= min_tokens and ok(chunk):
+                for chunk in split_text(p, count, min(target_tokens, max_tokens)):
+                    chunk = chunk.strip()
+                    if min_tokens <= count(chunk) <= max_tokens and ok(chunk):
                         yield chunk
                 continue
             if buf and buftok + pt > target_tokens:
@@ -207,6 +207,12 @@ class MRCRTask:
 
     def __init__(self, pool, markers, *, k=2, confounder_frac=0.5,
                  neg_frac=0.35, min_size=6, reserve_tokens=560):
+        if k != 2:
+            raise ValueError("MRCR currently supports exactly two query markers (--k 2)")
+        if not pool or len(markers) < 6 or min_size < 2:
+            raise ValueError("MRCR requires passages, at least six markers and min_size >= 2")
+        if not 0 <= confounder_frac <= 1 or not 0 <= neg_frac <= 1:
+            raise ValueError("confounder_frac and neg_frac must be in [0, 1]")
         self.pool = pool
         self.markers = markers
         self.k = k
@@ -329,8 +335,11 @@ def build_row(i, *, count, task, budget, size, seed, fmt, max_seq_length):
     while True:
         s = task.build(cur, rng)
         length = count(s.input)
-        if length <= budget or cur <= task.min_size:
+        candidate = shape_row({"format": fmt}, fmt, s.input, s.answer_prefix, s.answer_text())
+        if training_length(candidate, count)[0] <= max_seq_length:
             break
+        if cur <= task.min_size:
+            raise ValueError(f"{task.name}: minimum sample does not fit {max_seq_length} tokens")
         cur = max(task.min_size, int(cur * 0.9))
     prompt = s.input
     row = {
@@ -351,7 +360,7 @@ def build_row(i, *, count, task, budget, size, seed, fmt, max_seq_length):
         "meta": s.meta,
     }
     shape_row(row, fmt, prompt, s.answer_prefix, s.answer_text())
-    return row
+    return finalize_row(row, count, max_seq_length)
 
 
 # Per-worker state (populated once by the pool initializer). The HF tokenizer is
@@ -376,12 +385,6 @@ def _worker_build(i):
         i, count=_W["count"], task=_W["task"], budget=_W["budget"], size=_W["size"],
         seed=_W["seed"], fmt=_W["fmt"], max_seq_length=_W["max_seq_length"],
     )
-
-
-def resolve_workers(n):
-    """0 / negative -> all cores; else the requested count (capped at cpu_count)."""
-    cpu = os.cpu_count() or 1
-    return cpu if n is None or n <= 0 else min(n, cpu)
 
 
 # --------------------------------------------------------------------------- #
@@ -418,6 +421,8 @@ def main(argv=None):
     p.add_argument("--max_docs", type=int, default=None, help="cap docs scanned while filling the pool")
     args = p.parse_args(argv)
 
+    if args.num_samples < 1 or args.max_seq_length < 1 or args.pool_size < 1:
+        p.error("num_samples, max_seq_length and pool_size must be positive")
     tokenizer = get_tokenizer(args.tokenizer)
     count = tokenizer.count
 
@@ -439,11 +444,12 @@ def main(argv=None):
     task = MRCRTask(pool, markers, k=args.k, confounder_frac=args.confounder_frac,
                     neg_frac=args.neg_frac, min_size=args.min_size, reserve_tokens=reserve)
 
-    budget = args.max_seq_length - reserve
+    budget = args.max_seq_length
 
     def measure(sz):
         s = task.build(sz, random.Random(args.seed))
-        return count(s.input)
+        row = shape_row({"format": args.format}, args.format, s.input, s.answer_prefix, s.answer_text())
+        return training_length(row, count)[0]
 
     size = fit_size(measure, budget, task.min_size)
 
@@ -455,9 +461,9 @@ def main(argv=None):
                        neg_frac=args.neg_frac, min_size=args.min_size, reserve_tokens=reserve)
     if workers <= 1 or args.num_samples <= 1:
         print(f"generating {args.num_samples} samples (serial) ...")
-        rows = [build_row(i, count=count, task=task, budget=budget, size=size,
+        rows = (build_row(i, count=count, task=task, budget=budget, size=size,
                           seed=args.seed, fmt=args.format, max_seq_length=args.max_seq_length)
-                for i in range(args.num_samples)]
+                for i in range(args.num_samples))
     else:
         print(f"generating {args.num_samples} samples across {workers} workers ...")
         # fork inherits the loaded pool via copy-on-write (cheap); spawn re-pickles it.
@@ -465,18 +471,26 @@ def main(argv=None):
         chunk = max(1, args.num_samples // (workers * 8))
         initargs = (args.tokenizer, pool, markers, task_kwargs, budget, size,
                     args.seed, args.format, args.max_seq_length)
-        with ctx.Pool(workers, initializer=_worker_init, initargs=initargs) as ppool:
-            rows = ppool.map(_worker_build, range(args.num_samples), chunksize=chunk)
+        def parallel_rows():
+            with ctx.Pool(workers, initializer=_worker_init, initargs=initargs) as ppool:
+                yield from ppool.imap(_worker_build, range(args.num_samples), chunksize=min(chunk, 8))
+        rows = parallel_rows()
 
-    with open(out, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-    avg = sum(r["length"] for r in rows) / len(rows)
+    by_kind = {}
+    totals = [0, 0]
+    def measured_rows():
+        for row in rows:
+            totals[0] += row["length"]
+            totals[1] += 1
+            kind = row["meta"].get("kind", "mrcr")
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+            yield row
+    write_jsonl(out, measured_rows())
+    avg = totals[0] / totals[1]
     summary = {
         "output_dir": args.output_dir,
         "file": out,
-        "samples": len(rows),
+        "samples": totals[1],
         "fitted_size": size,
         "avg_len": round(avg),
         "max_seq_length": args.max_seq_length,

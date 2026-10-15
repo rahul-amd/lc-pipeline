@@ -22,7 +22,7 @@ class _Tiktoken:
         self.enc = tiktoken.get_encoding(encoding)
 
     def count(self, text: str) -> int:
-        return len(self.enc.encode(text))
+        return len(self.enc.encode(text, disallowed_special=()))
 
 
 class _HF:
@@ -36,25 +36,14 @@ class _HF:
 
 
 def get_tokenizer(spec: str):
-    """Resolve a tokenizer spec, falling back gracefully if it can't load.
-
-    Specs: ``hf:<name_or_path>`` | ``tiktoken[:<encoding>]`` | ``whitespace``.
-    """
-    try:
-        if spec.startswith("hf:"):
-            return _HF(spec[3:])
-        if spec.startswith("tiktoken"):
-            enc = spec.split(":", 1)[1] if ":" in spec else "cl100k_base"
-            return _Tiktoken(enc)
-        if spec == "whitespace":
-            return _Whitespace()
-        raise ValueError(f"unknown tokenizer spec: {spec!r}")
-    except Exception as e:  # noqa: BLE001 - fall back rather than crash datagen
-        print(f"[ruler++] tokenizer {spec!r} unavailable ({e}); falling back.", flush=True)
-    try:
-        return _Tiktoken()
-    except Exception:  # noqa: BLE001
+    """Resolve the requested tokenizer; never silently change the length unit."""
+    if spec.startswith("hf:") and spec[3:]:
+        return _HF(spec[3:])
+    if spec == "tiktoken" or spec.startswith("tiktoken:"):
+        return _Tiktoken(spec.split(":", 1)[1] if ":" in spec else "cl100k_base")
+    if spec == "whitespace":
         return _Whitespace()
+    raise ValueError(f"unknown tokenizer spec: {spec!r}")
 
 
 def fit_size(measure: Callable[[int], int], budget: int, min_size: int) -> int:
@@ -65,6 +54,8 @@ def fit_size(measure: Callable[[int], int], budget: int, min_size: int) -> int:
     search. Tasks need only be roughly monotonic in `size`; the per-sample loop
     in the driver handles any residual overflow.
     """
+    if min_size < 1 or budget < 1 or measure(min_size) > budget:
+        raise ValueError(f"minimum task size {min_size} does not fit token budget {budget}")
     probe = max(min_size, 256)
     tokens_per_size = max(measure(probe) / probe, 1e-6)
     upper = max(int(budget / tokens_per_size * 2), min_size * 2)

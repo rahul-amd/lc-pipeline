@@ -91,7 +91,7 @@ def main(data_dir):
             grand_ok += ok
             grand_n += n
     print(f"\nTOTAL: {grand_ok}/{grand_n} samples verified")
-    return 0 if grand_ok == grand_n else 1
+    return 0 if grand_n > 0 and grand_ok == grand_n else 1
 
 
 if __name__ == "__main__":

@@ -280,7 +280,7 @@ class GraphDescendants(GraphTask):
         node = next((x for x in nodes if g.adj[x]), g.nodes[0])
         answers, gold, at = _list_answer(reachable_set(g.adj, node))
         q = (f"Operation:\nList all descendants of node {node} (every node reachable by "
-             f"following directed edges from it).")
+             f"following directed edges from it, excluding {node} itself).")
         return q, answers, gold, at, {"op": "descendants", "node": node}
 
 
@@ -293,7 +293,7 @@ class GraphAncestors(GraphTask):
         node = next((x for x in nodes if g.radj[x]), g.nodes[0])
         answers, gold, at = _list_answer(reachable_set(g.radj, node))
         q = (f"Operation:\nList all ancestors of node {node} (every node that can reach "
-             f"it by following directed edges).")
+             f"it by following directed edges, excluding {node} itself).")
         return q, answers, gold, at, {"op": "ancestors", "node": node}
 
 

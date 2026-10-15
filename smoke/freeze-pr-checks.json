@@ -1,0 +1,23 @@
+{
+  "date_utc": "2026-10-15",
+  "scope": "Pre-PR static checks; no new generation or GPU run",
+  "remaining_local_change": "scripts/datagen.sh: default WORKERS=16; environment override retained",
+  "checks": {
+    "python_ast_files": 25,
+    "python_ast": "passed",
+    "bash_n_scripts_datagen": "passed",
+    "git_diff_cached_check": "passed"
+  },
+  "previous_execution_evidence": {
+    "report": "smoke/RESULTS.md",
+    "regression_tests_passed": 108,
+    "integration_matrix_rows": 278,
+    "final_shell_rows": 36
+  },
+  "excluded_generated_artifacts": [
+    "datagen_out/",
+    "multihop_out/",
+    "summarize_out/"
+  ],
+  "limitations": "Recorded validation used the existing environment; generated-content correctness is not certified."
+}

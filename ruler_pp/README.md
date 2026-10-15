@@ -86,6 +86,8 @@ Both formats carry the same metadata; they differ only in the trainable field:
   "gold": 85,                // structured gold (int / list / map / number)
   "answer_type": "int",      // int | number | list | map | string
   "length": 4043,            // token length of input + answer_prefix
+  "training_length": 4060,   // full training text/template including the answer
+  "length_mode": "text",     // text | chat_template | message_content
   "max_seq_length": 4096,
   "num_fewshot": 0,
   "seed": 42,

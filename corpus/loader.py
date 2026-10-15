@@ -38,9 +38,13 @@ def doc_mean(scores):
     """Mean of a per-page score list; tolerant of scalars / None."""
     if scores is None:
         return 0.0
-    if isinstance(scores, (list, tuple)):
-        return float(np.mean(scores)) if len(scores) else 0.0
-    return float(scores)
+    try:
+        values = np.asarray(scores, dtype=float)
+        if not values.size or not np.isfinite(values).all():
+            return 0.0
+        return float(values.mean())
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def schema(input_dir):
@@ -71,15 +75,9 @@ def iter_docs(input_dir, *, min_tokens=200, min_edu=0.75, drop_dups=True,
     "<file>:<row>" (stable provenance); `doc_id` falls back to it when the
     corpus has no id column.
     """
-    files, cols, text_col, id_col = schema(input_dir)
-    has_tok = "token_count" in cols
-    has_edu = "fw_edu_scores" in cols
-    has_mh = "minhash_cluster_size" in cols
-
-    read_cols = [text_col] + ([id_col] if id_col else [])
-    for c in ("token_count", "fw_edu_scores", "minhash_cluster_size"):
-        if c in cols:
-            read_cols.append(c)
+    files, _, _, _ = schema(input_dir)
+    if batch_size < 1 or (max_docs is not None and max_docs < 1):
+        raise ValueError("batch_size and max_docs must be positive")
 
     def bump(key):
         if stats is not None:
@@ -87,8 +85,18 @@ def iter_docs(input_dir, *, min_tokens=200, min_edu=0.75, drop_dups=True,
 
     kept = 0
     for f in files:
-        stem = os.path.basename(f)
-        for batch in pq.ParquetFile(f).iter_batches(batch_size=batch_size, columns=read_cols):
+        parquet = pq.ParquetFile(f)
+        cols = parquet.schema_arrow.names
+        text_col, id_col = pick(cols, TEXT_CANDIDATES), pick(cols, ID_CANDIDATES)
+        if text_col is None:
+            raise ValueError(f"no text column in {f}")
+        has_tok, has_edu, has_mh = (c in cols for c in
+                                   ("token_count", "fw_edu_scores", "minhash_cluster_size"))
+        read_cols = [text_col] + ([id_col] if id_col else [])
+        read_cols += [c for c in ("token_count", "fw_edu_scores", "minhash_cluster_size") if c in cols]
+        stem = os.path.relpath(f, input_dir)
+        offset = 0
+        for batch in parquet.iter_batches(batch_size=batch_size, columns=read_cols):
             d = batch.to_pydict()
             t = d[text_col]
             ids = d[id_col] if id_col else [None] * len(t)
@@ -98,7 +106,7 @@ def iter_docs(input_dir, *, min_tokens=200, min_edu=0.75, drop_dups=True,
             for row in range(len(t)):
                 bump("seen")
                 txt = t[row]
-                if not txt:
+                if not isinstance(txt, str) or not txt.strip():
                     bump("empty")
                     continue
                 ntok = int(tc[row]) if tc[row] is not None else 0
@@ -112,12 +120,13 @@ def iter_docs(input_dir, *, min_tokens=200, min_edu=0.75, drop_dups=True,
                     bump("lowedu")
                     continue
                 bump("kept")
-                src = f"{stem}:{row}"
+                src = f"{stem}:{offset + row}"
                 did = str(ids[row]) if ids[row] is not None else src
                 yield did, src, (txt[:char_cap] if char_cap else txt), ntok
                 kept += 1
                 if max_docs and kept >= max_docs:
                     return
+            offset += len(t)
 
 
 def fetch_texts_by_id(input_dir, needed):
@@ -125,17 +134,17 @@ def fetch_texts_by_id(input_dir, needed):
 
     Used to join cluster member texts back from the corpus by id.
     """
-    files, _cols, text_col, id_col = schema(input_dir)
-    if id_col is None:
-        raise SystemExit("this corpus has no id column to join member texts")
+    needed = set(map(str, needed))
+    if not needed:
+        return {}
     texts = {}
-    for f in files:
-        for batch in pq.ParquetFile(f).iter_batches(batch_size=4096, columns=[text_col, id_col]):
-            d = batch.to_pydict()
-            for did, txt in zip(d[id_col], d[text_col]):
-                sid = str(did)
-                if sid in needed and txt:
-                    texts[sid] = txt
-            if len(texts) >= len(needed):
-                return texts
+    for did, _src, text, _tokens in iter_docs(
+            input_dir, min_tokens=0, min_edu=0, drop_dups=False):
+        if did in needed:
+            if did in texts:
+                raise ValueError(f"duplicate document id in corpus: {did!r}")
+            texts[did] = text
+    missing = needed - texts.keys()
+    if missing:
+        raise ValueError(f"{len(missing)} cluster document IDs missing from corpus")
     return texts
