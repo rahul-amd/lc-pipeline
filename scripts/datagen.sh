@@ -45,7 +45,7 @@ OUT="${OUT:-datagen_out}"                      # root output dir
 FORMAT="${FORMAT:-sft}"                        # pt | sft
 TOKENIZER="${TOKENIZER:-hf:Qwen/Qwen2.5-0.5B}" # exact budgets across generators
 SEED="${SEED:-42}"
-WORKERS="${WORKERS:-0}"                         # parallel builder procs per stage
+WORKERS="${WORKERS:-16}"                       # parallel builder procs per stage
                                                # (0 = all CPU cores). Tokenizing
                                                # long prompts is the bottleneck;
                                                # this is the main speed knob.
