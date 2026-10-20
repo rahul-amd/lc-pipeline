@@ -25,7 +25,7 @@ class VariableArithmetic(Task):
         names: set[str] = set()
         while len(names) < num_hops + 1:
             names.add(_new_var(rng))
-        names = list(names)
+        names = sorted(names)
 
         cur = rng.randint(1, 20)
         chain = [f"VAR {names[0]} = {cur}"]

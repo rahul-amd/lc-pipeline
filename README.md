@@ -1,8 +1,9 @@
 # lc-pipeline — long-context datagen
 
-A pipeline for building long-context training data. Every generator emits the
-**same `Sample` contract** and the **same JSONL schema / `pt`+`sft` formats**, so
-data from different generators drops into one training mix unchanged.
+A pipeline for building long-context training data. All generators emit a training
+`text` field (`pt`) or a `messages` array (`sft`). Task-specific metadata differs:
+synthetic/retrieval tasks include deterministic golds, while QA and summarization
+include model-generated answers that need separate quality evaluation.
 
 ## Generators
 
@@ -54,11 +55,11 @@ answer reproduces that passage **verbatim**, prefixed with a per-sample random
 string (a guard against degenerate output). Gold = the exact source passage; eval
 metric = `difflib.SequenceMatcher` ratio ∈ [0,1]. `size` = number of paragraphs,
 binary-searched by the shared fitter to fill the budget, so the same task scales
-across 32k/128k/1M. Difficulty knobs (in `meta`): `--k` (query arity),
-`--confounder_frac`, `--neg_frac` — all decoupled from length.
+across 32k/128k/1M. Difficulty knobs: `--confounder_frac` and `--neg_frac`
+(query arity is currently fixed at `--k 2`) — all decoupled from length.
 
 **`idk/` — abstention MCQ ("I don't know").** Michelangelo's IDK
-(arXiv:2409.12640) adapted to deterministic, leakage-proof, no-LLM data. The
+(arXiv:2409.12640) adapted to deterministic, no-LLM data. The
 context is a long numbered list of real FinePDFs passages; a subset get a
 **binding sentence** appended stating a random code for a named item
 (`"The access code for the lemon is 7F3A-21."` — markers from `res/markers.txt`,
@@ -76,14 +77,14 @@ Codes are random so gold is deterministic; metric = accuracy on the chosen lette
 knobs (flags): `--unanswerable_frac` (0.7), `--subtle_frac` (0.15),
 `--binding_frac`, `--n_choices`.
 
-**`multihop/` — multi-hop QA (LLM-in-the-loop).** The only generator that needs an
-LLM to *write* the data, so it runs in **two offline phases** with your inference
-engine in between — this repo never calls the model itself. `prepare` chunks each
+**`multihop/` — multi-hop QA (LLM-in-the-loop).** Runs `prepare`, inference,
+and `assemble`. Inference can use an external dispatcher or the built-in
+`python -m corpus.infer` OpenAI-compatible client. `prepare` chunks each
 FinePDFs doc into ~512-token chunks, then for each doc emits several requests
 (`--requests_per_doc`, default 13), each sampling 3–4 random chunks. Every request
 is a **system + user** `messages` array: the system turn asks for **one** QA pair
-whose answer needs a fact from *every* chunk shown (true multi-hop, not answerable
-from any single chunk), and to reply with the exact phrase `cannot generate` when
+whose answer needs a fact from *every* chunk shown (a prompt requirement,
+not a verified property), and to reply with the exact phrase `cannot generate` when
 the chunks share no usable common ground; the user turn carries the numbered
 chunks. Output: `requests.jsonl` (feed this to any engine) + `docs.jsonl` (doc→full
 text, for stitching). Requests are **over-generated** so that after the inevitable
@@ -99,14 +100,14 @@ OpenAI chat/batch `choices[].message.content`, vLLM, raw text fields), overridab
 via `--id_field` / `--text_field`.
 
 The final prompt is the source document verbatim (plus the small QA tail), so its
-length is the document's length — there is no synthesized budget to fit. Control it
+length includes the document, questions, answers, and chat-template overhead. Control it
 by **gating docs by length** at `prepare`: `--min_doc_tokens` (floor) and
 `--max_seq_length` (cap; skips any doc longer than `max_seq_length - --reserve_tokens`,
 measured with `--tokenizer`). Unset `--max_seq_length` = whole docs of any length.
 
 **`summarize/` — long-context summarization (LLM-in-the-loop).** The same two-phase
-shape as `multihop`, simpler: one request per doc (summarization always succeeds, so
-no chunking or over-generation). `prepare` emits a **system + user** request per
+shape as `multihop`, simpler: one request per doc, without chunking or
+over-generation. Successful generation does not establish summary faithfulness. `prepare` emits a **system + user** request per
 quality-filtered doc — the user turn is the **full document followed by the
 instruction**, i.e. the instruction sits *after* the long context (the
 long-context-friendly layout `mrcr`/`idk` also use, so the model reads the doc before
@@ -129,6 +130,46 @@ carries the same fields (`instruction/context/question/answers/gold/answer_type/
 length/meta`) and honours the same `--format pt|sft` as the synthetic tasks. The
 FinePDFs reading is shared the other way — every corpus generator streams and
 quality-filters through `corpus/loader.py`, so the load logic lives in one place.
+
+## Length and import guarantees
+
+`training_length` counts the complete PT text, or the HF tokenizer's training
+chat template for SFT, including the answer. `length` remains the older prompt
+length field. `length_mode` identifies the measurement: `text`, `chat_template`,
+or `message_content`. Tokenizers without a chat template count newline-joined
+message content; downstream trainers must budget their own template overhead.
+Unknown/unavailable tokenizer specs fail rather than changing token units silently.
+Impossible synthetic budgets and unmet Untie quotas fail explicitly.
+
+Preparation saves a manifest with tokenizer settings, length cap and hashes of
+the request/source files. Assembly rejects changed bundles, unknown/duplicate
+response IDs, failed or truncated completions, malformed answers and final rows
+above the cap. Missing responses fail unless `--allow_partial` is explicit.
+Plain answers and complete `<think>...</think>` responses are accepted. Legacy
+bundles without a manifest need explicit `--tokenizer` and `--max_seq_length`.
+No cap is enforced when preparation explicitly leaves `--max_seq_length` unset.
+
+For small unattended runs, insert this command between prepare and assemble:
+
+```bash
+python -m corpus.infer --requests multihop_out/requests.jsonl \
+  --output multihop_out/responses.jsonl --base_url http://localhost:8000/v1 \
+  --model YOUR_MODEL --max_tokens 1024
+```
+
+Credentials are read from `OPENAI_API_KEY` (or `--api_key_env`). For servers that
+support it, `--chat_template_kwargs '{"enable_thinking":false}'` disables thinking.
+The client uses bounded concurrency and retries transient transport errors;
+large jobs can keep using a dispatcher and import its completed responses.
+
+`scripts/datagen.sh` supports `CONTEXT_LENGTHS`, `CLUSTER_DIR` and optional
+`RUN_LLM_INFER=1` with `API_BASE_URL`/`API_MODEL`. Stages receive `.complete` markers
+only after success; a nonempty partial directory is retried. Use a fresh `OUT`
+when changing configuration. The default still prepares LLM requests without
+running inference. Integer quotas are rounded down and zero quotas are rejected.
+
+See [smoke/README.md](smoke/README.md) for the bounded integration configuration,
+regressions and evidence. These check software/data integrity, not training gains.
 
 ## Layout
 
@@ -235,7 +276,7 @@ quality filters `--min_doc_tokens` / `--min_tokens` / `--min_edu` / `--keep_dups
 `--num_samples` sets an optional **per-flow** target (each `<flow>.jsonl` aims for
 this many rows). The sources are streamed once; if the pool is exhausted before
 the target, it is reused — each reuse re-chunks/re-spans/re-shuffles under a fresh
-seed, so reused docs yield distinct samples (variety is greatest for docs larger
+seed, so reused docs can yield different samples (duplicates remain possible; variety is greatest for docs larger
 than the window; docs that fit only vary by shuffle). `--max_reuse` (default 5)
 caps the extra passes and stops early if a full pass adds nothing. The reuse pool
 is bounded by `--max_clusters` + `--max_single_docs`, so raise those for a larger,

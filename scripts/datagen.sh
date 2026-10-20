@@ -30,10 +30,7 @@ set -euo pipefail
 # Run from the repo root so `python -m corpus/untie/mrcr/idk/...` resolve.
 cd "$(dirname "$0")/.."
 
-# Fix the hash seed so set/dict ordering in the synthetic tasks (e.g. ruler++'s
-# variable_arithmetic does list(set(...))) is deterministic. This makes runs
-# reproducible AND makes parallel output byte-identical to serial on platforms
-# that use spawn (workers otherwise get their own random hash seed).
+# Generators are deterministic across hash seeds; pin third-party behavior too.
 export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
 
 # --------------------------------------------------------------------------- #
@@ -48,13 +45,13 @@ OUT="${OUT:-datagen_out}"                      # root output dir
 FORMAT="${FORMAT:-sft}"                        # pt | sft
 TOKENIZER="${TOKENIZER:-hf:Qwen/Qwen2.5-0.5B}" # exact budgets across generators
 SEED="${SEED:-42}"
-WORKERS="${WORKERS:-0}"                         # parallel builder procs per stage
+WORKERS="${WORKERS:-16}"                       # parallel builder procs per stage
                                                # (0 = all CPU cores). Tokenizing
                                                # long prompts is the bottleneck;
                                                # this is the main speed knob.
 
 # Context-length buckets (tokens). Each generator's quota is split evenly here.
-LENGTHS=(8192 32768 131072 163840)
+read -r -a LENGTHS <<< "${CONTEXT_LENGTHS:-8192 32768 131072 163840}"
 NB=${#LENGTHS[@]}
 
 # Per-generator TOTAL quotas (sum = 1,000,000).
@@ -62,7 +59,10 @@ RULER_TOTAL="${RULER_TOTAL:-400000}"
 UNTIE_TOTAL="${UNTIE_TOTAL:-300000}"
 MRCR_TOTAL="${MRCR_TOTAL:-150000}"
 IDK_TOTAL="${IDK_TOTAL:-150000}"
-N_RULER_TASKS=22
+N_RULER_TASKS=$("$PYTHON" -m ruler_pp --list | wc -l)
+CLUSTER_DIR="${CLUSTER_DIR:-$OUT/clusters}"
+CLUSTER_MODEL="${CLUSTER_MODEL:-Qwen/Qwen3-Embedding-0.6B}"
+RUN_LLM_INFER="${RUN_LLM_INFER:-0}"
 
 # untie pool caps (raise for more variety; the reuse mechanism tops up to the
 # per-flow target by re-chunking/re-shuffling under fresh seeds). NOTE: the
@@ -91,14 +91,17 @@ IDK_PER=$((   IDK_TOTAL   / NB ))                   # per bucket
 
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 
-# needs_gen DIR — succeeds (0) when DIR is missing or empty, i.e. we should
-# generate into it. Skips regeneration when a non-empty output dir already
-# exists, so reruns are idempotent and resume where they left off.
+# Only successful stages receive a completion marker. A partial directory is
+# retried. Use a fresh OUT when changing settings; these are not cache keys.
 needs_gen() {
-  local d="$1"
-  [ -d "$d" ] || return 0
-  [ -z "$(ls -A "$d" 2>/dev/null)" ]
+  [ ! -f "$1/.complete" ]
 }
+for spec in "$RUN_RULER:$RULER_PER" "$RUN_UNTIE:$UNTIE_PER" "$RUN_MRCR:$MRCR_PER" "$RUN_IDK:$IDK_PER"; do
+  if [[ "$spec" == 1:* && "${spec#*:}" -lt 1 ]]; then
+    echo "Enabled generator quota rounds to zero; raise its total or reduce CONTEXT_LENGTHS" >&2
+    exit 1
+  fi
+done
 
 log "config"
 cat <<EOF
@@ -121,7 +124,7 @@ if [ "$RUN_RULER" = "1" ]; then
   for i in "${!LENGTHS[@]}"; do
     L="${LENGTHS[$i]}"
     if ! needs_gen "$OUT/ruler_pp/$L"; then
-      log "ruler++  len=$L  -> exists & non-empty, skipping"
+      log "ruler++  len=$L  -> completed, skipping"
       continue
     fi
     log "ruler++  len=$L  num_samples/task=$RULER_PER"
@@ -134,6 +137,7 @@ if [ "$RUN_RULER" = "1" ]; then
       --workers "$WORKERS" \
       --seed "$(( SEED + i ))" \
       --output_dir "$OUT/ruler_pp/$L"
+    touch "$OUT/ruler_pp/$L/.complete"
   done
 fi
 
@@ -143,24 +147,24 @@ fi
 #    buckets yield >= 2 units per sample.
 # --------------------------------------------------------------------------- #
 if [ "$RUN_UNTIE" = "1" ]; then
-  if [ ! -f "cluster_out/clusters.parquet" ]; then
+  if [ ! -f "$CLUSTER_DIR/clusters.parquet" ]; then
     log "clustering corpus (prerequisite for untie's cluster source)"
-    "$EMB_PYTHON" -m corpus.cluster --input_dir "$INPUT_DIR" --output_dir cluster_out
+    "$EMB_PYTHON" -m corpus.cluster --input_dir "$INPUT_DIR" --output_dir "$CLUSTER_DIR" --model "$CLUSTER_MODEL"
   else
-    log "clusters already present (cluster_out/clusters.parquet) — skipping"
+    log "clusters already present ($CLUSTER_DIR/clusters.parquet) — skipping"
   fi
 
   for i in "${!LENGTHS[@]}"; do
     L="${LENGTHS[$i]}"
     if ! needs_gen "$OUT/untie/$L"; then
-      log "untie  context_len=$L  -> exists & non-empty, skipping"
+      log "untie  context_len=$L  -> completed, skipping"
       continue
     fi
     TPT=$(( L / 8 )); [ "$TPT" -lt 512 ] && TPT=512   # paragraph-unit tokens
     log "untie  context_len=$L  num_samples/flow=$UNTIE_PER  target_para_tokens=$TPT"
     "$PYTHON" -m untie \
       --input_dir "$INPUT_DIR" \
-      --clusters cluster_out/clusters.parquet \
+      --clusters "$CLUSTER_DIR/clusters.parquet" \
       --output_dir "$OUT/untie/$L" \
       --context_len "$L" \
       --flows reconstruct,permutation \
@@ -174,6 +178,7 @@ if [ "$RUN_UNTIE" = "1" ]; then
       --max_reuse "$UNTIE_MAX_REUSE" \
       --workers "$WORKERS" \
       --seed "$(( SEED + i ))"
+    touch "$OUT/untie/$L/.complete"
   done
 fi
 
@@ -184,7 +189,7 @@ if [ "$RUN_MRCR" = "1" ]; then
   for i in "${!LENGTHS[@]}"; do
     L="${LENGTHS[$i]}"
     if ! needs_gen "$OUT/mrcr/$L"; then
-      log "mrcr  max_seq_length=$L  -> exists & non-empty, skipping"
+      log "mrcr  max_seq_length=$L  -> completed, skipping"
       continue
     fi
     log "mrcr  max_seq_length=$L  num_samples=$MRCR_PER"
@@ -197,6 +202,7 @@ if [ "$RUN_MRCR" = "1" ]; then
       --tokenizer "$TOKENIZER" \
       --workers "$WORKERS" \
       --seed "$(( SEED + i ))"
+    touch "$OUT/mrcr/$L/.complete"
   done
 fi
 
@@ -207,7 +213,7 @@ if [ "$RUN_IDK" = "1" ]; then
   for i in "${!LENGTHS[@]}"; do
     L="${LENGTHS[$i]}"
     if ! needs_gen "$OUT/idk/$L"; then
-      log "idk  max_seq_length=$L  -> exists & non-empty, skipping"
+      log "idk  max_seq_length=$L  -> completed, skipping"
       continue
     fi
     log "idk  max_seq_length=$L  num_samples=$IDK_PER"
@@ -220,6 +226,7 @@ if [ "$RUN_IDK" = "1" ]; then
       --tokenizer "$TOKENIZER" \
       --workers "$WORKERS" \
       --seed "$(( SEED + i ))"
+    touch "$OUT/idk/$L/.complete"
   done
 fi
 
@@ -233,36 +240,61 @@ fi
 if [ "$RUN_LLM_PREP" = "1" ]; then
   for i in "${!LENGTHS[@]}"; do
     L="${LENGTHS[$i]}"
-    if [ "$i" = "0" ]; then MIN_DOC=2000; else MIN_DOC="${LENGTHS[$(( i - 1 ))]}"; fi
+    if [ "$i" = "0" ]; then MIN_MH=2000; MIN_SUM=2000; else
+      MIN_MH=$(( LENGTHS[i-1] - 2048 + 1 ))
+      MIN_SUM=$(( LENGTHS[i-1] - 1024 + 1 ))
+    fi
 
     if needs_gen "$OUT/multihop/$L"; then
-      log "multihop prepare  bucket=$L  min_doc_tokens=$MIN_DOC  docs=$MULTIHOP_DOCS"
+      log "multihop prepare  bucket=$L  min_doc_tokens=$MIN_MH  docs=$MULTIHOP_DOCS"
       "$PYTHON" -m multihop prepare \
         --input_dir "$INPUT_DIR" \
         --output_dir "$OUT/multihop/$L" \
         --num_docs "$MULTIHOP_DOCS" \
-        --min_doc_tokens "$MIN_DOC" \
+        --min_doc_tokens "$MIN_MH" \
         --max_seq_length "$L" \
         --tokenizer "$TOKENIZER" \
         --seed "$(( SEED + i ))"
+      touch "$OUT/multihop/$L/.complete"
     else
-      log "multihop prepare  bucket=$L  -> exists & non-empty, skipping"
+      log "multihop prepare  bucket=$L  -> completed, skipping"
     fi
 
     if needs_gen "$OUT/summarize/$L"; then
-      log "summarize prepare  bucket=$L  min_doc_tokens=$MIN_DOC  docs=$SUMMARIZE_DOCS"
+      log "summarize prepare  bucket=$L  min_doc_tokens=$MIN_SUM  docs=$SUMMARIZE_DOCS"
       "$PYTHON" -m summarize prepare \
         --input_dir "$INPUT_DIR" \
         --output_dir "$OUT/summarize/$L" \
         --num_docs "$SUMMARIZE_DOCS" \
-        --min_doc_tokens "$MIN_DOC" \
+        --min_doc_tokens "$MIN_SUM" \
         --max_seq_length "$L" \
         --summary_words "$SUMMARIZE_WORDS" \
         --tokenizer "$TOKENIZER" \
         --seed "$(( SEED + i ))"
+      touch "$OUT/summarize/$L/.complete"
     else
-      log "summarize prepare  bucket=$L  -> exists & non-empty, skipping"
+      log "summarize prepare  bucket=$L  -> completed, skipping"
     fi
+  done
+fi
+
+# Optional small-run inference. Large runs may continue to use a dispatcher.
+if [ "$RUN_LLM_INFER" = "1" ]; then
+  : "${API_BASE_URL:?set API_BASE_URL including /v1}"
+  : "${API_MODEL:?set API_MODEL}"
+  for gen in multihop summarize; do
+    for L in "${LENGTHS[@]}"; do
+      bundle="$OUT/$gen/$L"
+      if [ ! -f "$bundle/.assembled" ]; then
+        "$PYTHON" -m corpus.infer --requests "$bundle/requests.jsonl" \
+          --output "$bundle/responses.jsonl" --base_url "$API_BASE_URL" --model "$API_MODEL" \
+          --max_tokens "${API_MAX_TOKENS:-1024}" \
+          --chat_template_kwargs "${API_CHAT_TEMPLATE_KWARGS:-null}"
+        "$PYTHON" -m "$gen" assemble --requests_dir "$bundle" \
+          --responses "$bundle/responses.jsonl" --format "$FORMAT"
+        touch "$bundle/.assembled"
+      fi
+    done
   done
 fi
 

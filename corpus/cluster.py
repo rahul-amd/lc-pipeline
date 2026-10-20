@@ -88,6 +88,8 @@ def topk_neighbours(emb, k, device, chunk=2048):
     import torch
 
     n = emb.shape[0]
+    if n < 1 or k < 1 or chunk < 1:
+        raise ValueError("neighbors require nonempty embeddings, positive k and chunk size")
     k = min(k, n - 1)
     # fp16 engages tensor cores: the matmul is O(n^2 * d) and dominates at 500k docs.
     # Loss is negligible for top-k neighbour selection on L2-normalized vectors.
@@ -97,7 +99,7 @@ def topk_neighbours(emb, k, device, chunk=2048):
     for s in tqdm(range(0, n, chunk), desc="neighbours"):
         q = x[s:s + chunk]
         sims = q @ x.T                      # (b, n) cosine since rows are normalized
-        sims[torch.arange(q.shape[0]), torch.arange(s, s + q.shape[0])] = -1.0  # mask self
+        sims[torch.arange(q.shape[0]), torch.arange(s, s + q.shape[0])] = -torch.inf  # mask self even for antipodal vectors
         vals, ind = torch.topk(sims, k, dim=1)
         idx_out[s:s + q.shape[0]] = ind.cpu().numpy()
         sim_out[s:s + q.shape[0]] = vals.float().cpu().numpy()
@@ -112,6 +114,8 @@ def topk_neighbours(emb, k, device, chunk=2048):
 # --------------------------------------------------------------------------- #
 def greedy_chain(nbr_idx, nbr_sim, tokens, budget, floor):
     n = len(tokens)
+    if budget < 1 or np.any(tokens <= 0) or np.any(tokens > budget):
+        raise ValueError("cluster token counts must be positive and fit the budget")
     used = np.zeros(n, dtype=bool)
     cluster_id = np.full(n, -1, dtype=np.int64)
     rank = np.full(n, -1, dtype=np.int64)
@@ -195,6 +199,10 @@ def main(argv=None):
             min_edu=args.min_edu, drop_dups=not args.keep_dups,
             char_cap=args.embed_tokens * 12,
         )
+        if not len(texts) or np.any(tokens <= 0):
+            raise ValueError("clustering requires nonempty corpus with positive token_count metadata")
+        if len(set(ids)) != len(ids):
+            raise ValueError("duplicate document IDs in clustering corpus")
         emb = embed(texts, args.model, args.embed_tokens, args.batch_size, args.device)
         np.save(emb_path, emb)
         import pyarrow as pa
@@ -206,6 +214,16 @@ def main(argv=None):
         del texts
     print(f"embeddings: {emb.shape} | tokens: total {int(tokens.sum()):,}  median {int(np.median(tokens))}")
 
+    if len(emb) != len(ids) or not np.isfinite(emb).all():
+        raise ValueError("invalid or misaligned embedding cache")
+    # Oversized documents cannot form a budget-compliant cluster, even alone.
+    keep = tokens <= args.budget
+    excluded_oversized = int((~keep).sum())
+    ids = [x for x, ok in zip(ids, keep) if ok]
+    srcs = [x for x, ok in zip(srcs, keep) if ok]
+    tokens, emb = tokens[keep], emb[keep]
+    if not len(ids):
+        raise ValueError("no documents fit the cluster token budget")
     nbr_idx, nbr_sim = topk_neighbours(emb, args.topk, args.device)
     cluster_id, rank, n_clusters = greedy_chain(nbr_idx, nbr_sim, tokens, args.budget, args.floor)
 
@@ -225,6 +243,7 @@ def main(argv=None):
     multi = int((sizes > 1).sum())
     summary = {
         "n_docs": int(len(ids)),
+        "excluded_oversized_docs": excluded_oversized,
         "n_clusters": int(n_clusters),
         "multi_doc_clusters": multi,
         "singletons": int((sizes == 1).sum()),

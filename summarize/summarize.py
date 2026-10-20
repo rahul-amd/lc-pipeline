@@ -1,8 +1,7 @@
 """Long-context summarization datagen over FinePDFs documents (LLM-in-the-loop).
 
-Same two-phase shape as `multihop` — the repo never calls the model; you run the
-inference in between — but simpler: one request per document (summarization always
-succeeds, so there is no chunking, no over-generation, and no "cannot generate").
+Same prepare/inference/assemble shape as `multihop`, with an external dispatcher
+or the built-in `corpus.infer` API client, but simpler: one request per document (there is no chunking or over-generation; summaries still need quality evaluation).
 
   prepare   for each quality-filtered doc, emit ONE request whose user turn is the
             full document followed by the summarization instruction (instruction
@@ -26,13 +25,14 @@ Final shapes (the summarization instruction sits after the document):
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import re
 
 from corpus import loader
-from multihop.multihop import extract_text, load_jsonl
+from corpus.llm import (assembly_arguments, document_key, load_bundle, load_jsonl,
+                        publish, save_manifest)
+from multihop.multihop import extract_text
 from ruler_pp.lengths import get_tokenizer
 
 # --------------------------------------------------------------------------- #
@@ -71,6 +71,12 @@ def build_messages(doc, instruction):
 # phase A: prepare requests
 # --------------------------------------------------------------------------- #
 def prepare(args):
+    for key in ("num_docs", "max_docs", "max_seq_length"):
+        value = getattr(args, key, None)
+        if value is not None and value < 1:
+            raise ValueError(f"{key} must be positive")
+    if args.reserve_tokens < 0:
+        raise ValueError("reserve_tokens cannot be negative")
     tokenizer = get_tokenizer(args.tokenizer)
     count = tokenizer.count
     instruction = final_instruction(args.summary_words)
@@ -92,14 +98,16 @@ def prepare(args):
     with open(req_path, "w", encoding="utf-8") as rf, \
             open(doc_path, "w", encoding="utf-8") as df:
         for did, src, txt, _ntok in loader.iter_docs(
-                args.input_dir, min_tokens=args.min_doc_tokens, min_edu=args.min_edu,
+                args.input_dir, min_tokens=0, min_edu=args.min_edu,
                 drop_dups=not args.keep_dups, max_docs=args.max_docs):
             doc_tokens = count(txt)
+            if doc_tokens < args.min_doc_tokens:
+                continue
             if max_doc_tokens is not None and doc_tokens > max_doc_tokens:
                 skipped_long += 1
                 continue
 
-            doc_local = f"sum-{n_docs:06d}"
+            doc_local = document_key("sum", did, txt, args)
             doc_tok_sum += doc_tokens
             df.write(json.dumps(
                 {"doc": doc_local, "doc_id": did, "source": src,
@@ -113,6 +121,7 @@ def prepare(args):
             if args.num_docs and n_docs >= args.num_docs:
                 break
 
+    save_manifest(args, n_docs, n_docs)
     print(json.dumps({
         "phase": "prepare",
         "output_dir": args.output_dir,
@@ -133,7 +142,7 @@ def prepare(args):
 # --------------------------------------------------------------------------- #
 # phase B: assemble final dataset from responses
 # --------------------------------------------------------------------------- #
-_PREAMBLE_RE = re.compile(r"^\s*(?:here\s+is\s+(?:a\s+|the\s+)?summary[:.]?|summary[:.]?)\s*",
+_PREAMBLE_RE = re.compile(r"^\s*(?:here\s+is\s+(?:a\s+|the\s+)?summary[:.]?|summary[:.])\s*",
                           re.IGNORECASE)
 
 
@@ -147,64 +156,26 @@ def clean_summary(text):
 
 
 def assemble(args):
-    docs = {r["doc"]: r for r in load_jsonl(os.path.join(args.requests_dir, "docs.jsonl"))}
-    req_to_doc = {r["id"]: r["doc"]
-                  for r in load_jsonl(os.path.join(args.requests_dir, "requests.jsonl"))}
-
-    resp_files = sorted(glob.glob(args.responses)) if any(c in args.responses for c in "*?[") \
-        else [args.responses]
-    if not resp_files:
-        raise SystemExit(f"no response files matched {args.responses!r}")
-
-    summaries = {}        # doc_local -> summary text
-    n_resp = n_empty = n_unmatched = 0
-    for path in resp_files:
-        for row in load_jsonl(path):
-            n_resp += 1
-            rid = row.get(args.id_field) or row.get("id") or row.get("custom_id")
-            doc = req_to_doc.get(rid)
-            if doc is None:
-                n_unmatched += 1
-                continue
-            summary = clean_summary(extract_text(row, args.text_field))
-            if not summary:
-                n_empty += 1
-                continue
-            summaries[doc] = summary
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    out = os.path.join(args.output_dir, "summarize.jsonl")
-    written = 0
-    with open(out, "w", encoding="utf-8") as f:
-        for doc in sorted(summaries):
-            meta_doc = docs.get(doc, {})
-            text = meta_doc.get("text", "")
-            instruction = meta_doc.get("instruction", final_instruction())
-            summary = summaries[doc]
-            row = {
-                "id": doc,
-                "task": "summarize",
-                "format": args.format,
-                "doc_id": meta_doc.get("doc_id"),
-                "source": meta_doc.get("source"),
-                "doc_tokens": meta_doc.get("doc_tokens"),
-                "instruction": instruction,
-                "summary": summary,
-            }
-            shape_summarize(row, args.format, text, instruction, summary)
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            written += 1
-
-    print(json.dumps({
-        "phase": "assemble",
-        "output_dir": args.output_dir,
-        "file": out,
-        "responses_read": n_resp,
-        "summaries_written": written,
-        "empty_or_unparsed": n_empty,
-        "unmatched_ids": n_unmatched,
-        "format": args.format,
-    }, indent=2))
+    docs, requests, responses, tokenizer, limit, missing = load_bundle(args)
+    rows = []
+    for rid, request in requests.items():
+        if rid not in responses:
+            continue
+        summary = clean_summary(extract_text(responses[rid], args.text_field))
+        if not summary:
+            raise ValueError(f"empty or incomplete summary: {rid}")
+        doc = request["doc"]
+        source = docs[doc]
+        instruction = source.get("instruction", final_instruction())
+        row = {"id": doc, "task": "summarize", "format": args.format,
+               "doc_id": source["doc_id"], "source": source["source"],
+               "doc_tokens": source["doc_tokens"], "instruction": instruction,
+               "summary": summary}
+        shape_summarize(row, args.format, source["text"], instruction, summary)
+        rows.append(row)
+    publish(args, "summarize", rows, tokenizer, limit,
+            {"responses": len(responses), "missing": missing,
+             "quality_note": "Completeness and factual consistency require separate evaluation."})
 
 
 def shape_summarize(row, fmt, doc, instruction, summary):
@@ -255,6 +226,7 @@ def main(argv=None):
     pa.add_argument("--format", choices=["pt", "sft"], default="sft")
     pa.add_argument("--id_field", default=None, help="response key holding the request id")
     pa.add_argument("--text_field", default=None, help="response key holding the generated text")
+    assembly_arguments(pa)
     pa.set_defaults(func=assemble)
 
     args = p.parse_args(argv)
